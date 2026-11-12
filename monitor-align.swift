@@ -1,10 +1,11 @@
 import AppKit
 import CoreGraphics
+import ServiceManagement
 
-// 多螢幕對齊：用眼睛對齊相鄰螢幕的物理位置，工具算出精確 origin，游標跨螢幕不跳位。
-// 每台非主螢幕貼著它的 parent（從主螢幕沿「邊相接」推導），只有一條垂直於貼合邊的可動線；
-// parent 上同一位置畫一條參考線。把兩條線調到「看起來連成一線」後按 Enter。
+// 多螢幕游標修正：常駐選單列，游標跨過相鄰螢幕的交界時，依實體公釐換算沿邊位置再放到對面螢幕。
+// 每組相鄰螢幕各自校正一條參考線（滑鼠為主的引導式校正），不移動螢幕、沒有 parent。
 // 一律以 CGDirectDisplayID 為 key、CGDisplayBounds 座標（左上原點，整數 pt）。
+// 用法：app 模式不帶參數；CLI：--selftest、--dump。
 
 typealias ID = CGDirectDisplayID
 
@@ -18,188 +19,39 @@ struct R: Equatable {
   func hits(_ o: R) -> Bool { x < o.maxX && o.x < maxX && y < o.maxY && o.y < maxY }
 }
 
-/// child 在 parent 的哪一側
+/// b 在 a 的哪一側
 enum Side: String, Codable {
   case left, right, above, below
-  var opposite: Side { [.left: .right, .right: .left, .above: .below, .below: .above][self]! }
-  /// 左右鄰居調橫線（改 y），上下鄰居調直線（改 x）
+  var opposite: Side {
+    switch self { case .left: .right; case .right: .left; case .above: .below; case .below: .above }
+  }
+  /// 左右鄰居的參考線是橫線（沿邊軸是 y），上下鄰居是直線（沿邊軸是 x）
   var horizontalLine: Bool { self == .left || self == .right }
 }
-
-/// anchor：參考線在 parent 區域座標（沿邊軸，離上／左緣的 pt），貼合邊重疊區段中點
-struct Link { let parent: ID; let side: Side; let anchor: Int }
 
 func along(_ r: R, _ s: Side) -> Int { s.horizontalLine ? r.y : r.x }
 func span(_ r: R, _ s: Side) -> Int { s.horizontalLine ? r.h : r.w }
 
-/// b 相對 a 的貼合側與沿邊重疊區間 [lo, hi)；邊不相接或只碰角回 nil
-func contact(_ a: R, _ b: R) -> (Side, Int, Int)? {
-  let (y0, y1) = (max(a.y, b.y), min(a.maxY, b.maxY))
-  let (x0, x1) = (max(a.x, b.x), min(a.maxX, b.maxX))
-  if y1 > y0 {
-    if b.x == a.maxX { return (.right, y0, y1) }
-    if b.maxX == a.x { return (.left, y0, y1) }
-  }
-  if x1 > x0 {
-    if b.y == a.maxY { return (.below, x0, x1) }
-    if b.maxY == a.y { return (.above, x0, x1) }
-  }
-  return nil
-}
-
-/// v 貼著 u 時的 link（參考線取重疊中點）與重疊長度；不相接回 nil
-func link(_ r: [ID: R], parent u: ID, child v: ID) -> (len: Int, link: Link)? {
-  guard let (s, lo, hi) = contact(r[u]!, r[v]!) else { return nil }
-  return (hi - lo, Link(parent: u, side: s, anchor: ((lo + hi) >> 1) - along(r[u]!, s)))
-}
-
-/// 每條 link 的 child 仍貼在 parent 的同一側
-func sidesHold(_ r: [ID: R], _ links: [ID: Link]) -> Bool {
-  links.allSatisfy { contact(r[$0.value.parent]!, r[$0.key]!)?.0 == $0.value.side }
-}
-
-/// 從 root 一層一層長樹：每輪只讓「上一輪以前已加入」的螢幕當 parent，所以直接貼 root 的都以 root 為 parent；
-/// 同一輪內挑沿邊重疊最長者。不連通回 nil。
-func derive(_ r: [ID: R], root: ID) -> (order: [ID], links: [ID: Link])? {
-  guard r[root] != nil else { return nil }
-  var order = [root], links: [ID: Link] = [:]
-  let ids = r.keys.sorted()
-  while order.count < r.count {
-    let joined = order
-    for v in ids where !joined.contains(v) {
-      var best: (len: Int, link: Link)?
-      for u in joined {
-        guard let c = link(r, parent: u, child: v), c.len > (best?.len ?? 0) else { continue }
-        best = c
-      }
-      if let b = best { links[v] = b.link; order.append(v) }
-    }
-    if order.count == joined.count { return nil }
-  }
-  return (order, links)
-}
-
-/// links 是否仍描述 rects：同一批螢幕、root 沒換、每條貼合側沒變、無重疊且參考線在範圍內
-func stillValid(_ r: [ID: R], order: [ID], links: [ID: Link], root: ID) -> Bool {
-  order.first == root && Set(order) == Set(r.keys) && links.count == order.count - 1
-    && sidesHold(r, links) && valid(r, links)
-}
-
-/// 由 links 拓樸排序（parent 一定在前）；有環回 nil
-func topo(_ root: ID, _ links: [ID: Link]) -> [ID]? {
-  var o = [root], rest = links
-  while !rest.isEmpty {
-    let ready = rest.filter { o.contains($0.value.parent) }.keys.sorted()
-    if ready.isEmpty { return nil }
-    o += ready; ready.forEach { rest[$0] = nil }
-  }
-  return o
-}
-
-/// child 與 parent 的沿邊偏移（調整期間唯一會變的量）
-func offsets(_ r: [ID: R], _ links: [ID: Link]) -> [ID: Int] {
-  links.reduce(into: [:]) { $0[$1.key] = along(r[$1.key]!, $1.value.side) - along(r[$1.value.parent]!, $1.value.side) }
-}
-
-/// 由偏移算出所有絕對 rect；主螢幕固定 (0,0)，垂直軸直接 flush 到 parent 邊緣（整數，不會有 1pt 縫）
-func layout(_ order: [ID], _ links: [ID: Link], _ dims: [ID: R], _ off: [ID: Int]) -> [ID: R] {
-  var out: [ID: R] = [order[0]: R(x: 0, y: 0, w: dims[order[0]]!.w, h: dims[order[0]]!.h)]
-  for id in order.dropFirst() {
-    let l = links[id]!, p = out[l.parent]!, d = dims[id]!, o = off[id]!
-    switch l.side {
-    case .right: out[id] = R(x: p.maxX, y: p.y + o, w: d.w, h: d.h)
-    case .left: out[id] = R(x: p.x - d.w, y: p.y + o, w: d.w, h: d.h)
-    case .below: out[id] = R(x: p.x + o, y: p.maxY, w: d.w, h: d.h)
-    case .above: out[id] = R(x: p.x + o, y: p.y - d.h, w: d.w, h: d.h)
-    }
-  }
-  return out
-}
-
-/// 任兩台不重疊，且每條參考線都落在它的 child 範圍內（等於重疊 >= 1，兩邊的線都畫得出來）
-func valid(_ r: [ID: R], _ links: [ID: Link]) -> Bool {
-  let v = Array(r.values)
-  for i in v.indices { for j in v.indices where j > i && v[i].hits(v[j]) { return false } }
-  for (c, l) in links {
-    let ref = along(r[l.parent]!, l.side) + l.anchor, lo = along(r[c]!, l.side)
-    if ref < lo || ref >= lo + span(r[c]!, l.side) { return false }
-  }
-  return true
-}
-
-/// 把 a 貼到 b 的 side 側，沿邊軸對齊起點
-func place(_ a: R, beside b: R, _ s: Side) -> R {
-  var a = a
-  switch s {
-  case .right: a.x = b.maxX; a.y = b.y
-  case .left: a.x = b.x - a.w; a.y = b.y
-  case .below: a.y = b.maxY; a.x = b.x
-  case .above: a.y = b.y - a.h; a.x = b.x
-  }
-  return a
-}
-
-struct Plan { var rects: [ID: R]; var order: [ID]; var links: [ID: Link] }
-
-/// 排列：a 貼到 b 的 side 側。只改 a 的 link（直接寫死，不重推），其餘沿用；
-/// 沿用的 link 失效（貼合側變了、有環、參考線出範圍）才整棵重推。重疊或不連通回 nil
-func arranged(_ cur: [ID: R], order: [ID], links: [ID: Link], a: ID, side: Side, b: ID) -> Plan? {
-  guard a != b, let ra = cur[a], let rb = cur[b] else { return nil }
-  var n = cur
-  n[a] = place(ra, beside: rb, side)
-  guard !n.contains(where: { $0.key != a && $0.value.hits(n[a]!) }) else { return nil }
-  func plan(_ o: [ID], _ l: [ID: Link]) -> Plan? {
-    let rects = layout(o, l, n, offsets(n, l))
-    return valid(rects, l) ? Plan(rects: rects, order: o, links: l) : nil
-  }
-  var l = links
-  if a != order[0], let c = link(n, parent: b, child: a) { l[a] = c.link }
-  if sidesHold(n, l),
-     let o = topo(order[0], l), let p = plan(o, l) { return p }
-  guard let d = derive(n, root: order[0]) else { return nil }
-  return plan(d.order, d.links)
-}
-
-/// pt/mm。mm 為 0、寬高比對不上（旋轉會自動換邊比對）或不合理就回 nil
-func scale(_ w: Int, _ h: Int, _ mm: CGSize) -> CGFloat? {
-  guard mm.width > 0, mm.height > 0 else { return nil }
-  var best: (d: CGFloat, s: CGFloat)?
-  for (mw, mh) in [(mm.width, mm.height), (mm.height, mm.width)] {
-    let sx = CGFloat(w) / mw, sy = CGFloat(h) / mh
-    let d = abs(sx - sy) / max(sx, sy)
-    if best == nil || d < best!.d { best = (d, (sx + sy) / 2) }
-  }
-  guard let b = best, b.d <= 0.05, (1.5...15).contains(b.s) else { return nil }
-  return b.s
-}
-
 /// 兩台螢幕之間的一條參考邊（雙向各存一筆）。side = b 相對 a 的側；ref 是各自螢幕的區域座標（離上緣／左緣幾 pt）
 struct Edge { let a, b: ID; let side: Side; let refA, refB: CGFloat }
 
-/// 配對：沒有直接貼合（或不是 tree 邊）的相鄰螢幕，各自存一條參考線。side 固定 .right／.below（a 在左／上）
+/// 一組相鄰螢幕。side 固定 .right／.below（a 在左／上）
 struct Pair: Equatable { let a, b: ID; let side: Side; var refA, refB: Int }
 
-/// tree link 與配對一起轉成雙向 Edge。off 由 rects 自己算，不讀互動模式未套用的 M.off
-func makeEdges(_ r: [ID: R], _ links: [ID: Link], _ pairs: [Pair]) -> [Edge] {
-  let off = offsets(r, links)
-  var out: [Edge] = []
-  func add(_ a: ID, _ b: ID, _ s: Side, _ ra: Int, _ rb: Int) {
-    out.append(Edge(a: a, b: b, side: s, refA: CGFloat(ra), refB: CGFloat(rb)))
-    out.append(Edge(a: b, b: a, side: s.opposite, refA: CGFloat(rb), refB: CGFloat(ra)))
+func makeEdges(_ pairs: [Pair]) -> [Edge] {
+  pairs.flatMap { p in
+    [Edge(a: p.a, b: p.b, side: p.side, refA: CGFloat(p.refA), refB: CGFloat(p.refB)),
+     Edge(a: p.b, b: p.a, side: p.side.opposite, refA: CGFloat(p.refB), refB: CGFloat(p.refA))]
   }
-  for (c, l) in links { add(l.parent, c, l.side, l.anchor, l.anchor - off[c]!) }
-  for p in pairs { add(p.a, p.b, p.side, p.refA, p.refB) }
-  return out
 }
 
-/// 非 tree 邊的相鄰螢幕：b 完全在 a 的右／下側、沿邊重疊 > 0、空隙小於兩台中較小的寬（高）且沒壓到第三台。
-/// 預設參考線取重疊中點（兩台全域位置相同）；keep 裡 a、b、side 沒變且 ref 仍在範圍內的沿用
-func derivePairs(_ r: [ID: R], _ links: [ID: Link], keep: [Pair]) -> [Pair] {
+/// 所有相鄰螢幕組：b 完全在 a 的右／下側、沿邊重疊 > 0、空隙小於兩台中較小的寬（高）且沒壓到第三台。
+/// 預設參考線取重疊中點（兩台全域位置相同）；keep 裡 a、b、side 都沒變且 ref 仍在範圍內的沿用
+func derivePairs(_ r: [ID: R], keep: [Pair]) -> [Pair] {
   let ids = r.keys.sorted()
   var out: [Pair] = []
   for (i, x) in ids.enumerated() {
     for y in ids[(i + 1)...] {
-      guard links[x]?.parent != y, links[y]?.parent != x else { continue }
       var (a, b, side) = (x, y, Side.right)
       if r[a]!.maxX <= r[b]!.x {
       } else if r[b]!.maxX <= r[a]!.x { swap(&a, &b)
@@ -243,95 +95,151 @@ func neighbors(_ edges: [Edge], _ a: ID) -> [(id: ID, edge: Side)] {
   edges.filter { $0.a == a }.map { ($0.b, $0.side) }
 }
 
+/// 貼著 a 的 e 邊、且朝外的 delta（pt）；不貼邊回 0
+func outward(_ r: R, _ p: CGPoint, _ e: Side, dx: CGFloat, dy: CGFloat) -> CGFloat {
+  switch e {
+  case .left: return p.x <= CGFloat(r.x + 1) ? max(0, -dx) : 0
+  case .right: return p.x >= CGFloat(r.maxX - 2) ? max(0, dx) : 0
+  case .above: return p.y <= CGFloat(r.y + 1) ? max(0, -dy) : 0
+  case .below: return p.y >= CGFloat(r.maxY - 2) ? max(0, dy) : 0
+  }
+}
+
+/// 卡在邊上往外推時，要依序試的鄰居：朝外分量大的先，同分依 id，角落斜推順序才穩定
+func pushOrder(_ r: R, _ p: CGPoint, _ nbs: [(id: ID, edge: Side)], dx: CGFloat, dy: CGFloat) -> [(id: ID, push: CGFloat)] {
+  nbs.map { ($0.id, outward(r, p, $0.edge, dx: dx, dy: dy)) }.filter { $0.1 > 0 }
+    .sorted { $0.1 != $1.1 ? $0.1 > $1.1 : $0.0 < $1.0 }
+}
+
+/// pt/mm。mm 為 0、寬高比對不上（旋轉會自動換邊比對）或不合理就回 nil
+func scale(_ w: Int, _ h: Int, _ mm: CGSize) -> CGFloat? {
+  guard mm.width > 0, mm.height > 0 else { return nil }
+  var best: (d: CGFloat, s: CGFloat)?
+  for (mw, mh) in [(mm.width, mm.height), (mm.height, mm.width)] {
+    let sx = CGFloat(w) / mw, sy = CGFloat(h) / mh
+    let d = abs(sx - sy) / max(sx, sy)
+    if best == nil || d < best!.d { best = (d, (sx + sy) / 2) }
+  }
+  guard let b = best, b.d <= 0.05, (1.5...15).contains(b.s) else { return nil }
+  return b.s
+}
+
+// MARK: - 校正檔 v2（純資料；key 與解析度對得上才沿用，與螢幕排列無關）
+
+/// 同型號且序號為 0 的兩台 base 會撞號：只有撞到時才依位置（左→右、上→下）加 #1、#2
+func uniqueKeys(_ base: [ID: String], _ r: [ID: R]) -> [ID: String] {
+  var out = base
+  for (k, ids) in Dictionary(grouping: base.keys, by: { base[$0]! }) where ids.count > 1 {
+    let sorted = ids.sorted { (r[$0]!.x, r[$0]!.y, $0) < (r[$1]!.x, r[$1]!.y, $1) }
+    for (i, id) in sorted.enumerated() { out[id] = "\(k)#\(i + 1)" }
+  }
+  return out
+}
+
+/// 校正檔裡認人的字串：唯一化後的 key + 解析度。解析度改了就不吻合，該組回預設
+func calTags(_ base: [ID: String], _ r: [ID: R]) -> [ID: String] {
+  uniqueKeys(base, r).reduce(into: [:]) { $0[$1.key] = "\($1.value)/\(r[$1.key]!.w)x\(r[$1.key]!.h)" }
+}
+
+struct CalPair: Codable, Equatable { let a: String; let b: String; let side: Side; let refA: Int; let refB: Int }
+struct CalFile: Codable { let version: Int; let pairs: [CalPair] }
+
+func encodeCalib(_ pairs: [CalPair]) -> Data {
+  let enc = JSONEncoder(); enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+  return (try? enc.encode(CalFile(version: 2, pairs: pairs))) ?? Data()
+}
+
+/// 不是 v2（含 #4／#5 的舊格式）一律當沒有校正
+func decodeCalib(_ data: Data) -> [CalPair] {
+  guard let f = try? JSONDecoder().decode(CalFile.self, from: data), f.version == 2 else { return [] }
+  return f.pairs
+}
+
+/// 檔案裡的組對到目前螢幕（兩端 tag 都在才算）
+func matchCalib(_ saved: [CalPair], live: [String: ID]) -> [Pair] {
+  saved.compactMap { c in
+    guard let a = live[c.a], let b = live[c.b] else { return nil }
+    return Pair(a: a, b: b, side: c.side, refA: c.refA, refB: c.refB)
+  }
+}
+
+/// 新校正的組覆蓋同兩台的舊紀錄；沒接著的螢幕的舊紀錄保留
+func mergeCalib(_ old: [CalPair], _ new: [CalPair]) -> [CalPair] {
+  old.filter { o in !new.contains { Set([$0.a, $0.b]) == Set([o.a, o.b]) } } + new
+}
+
 func selftest() -> Never {
   var fails = 0
   func check(_ ok: Bool, _ what: String) { if !ok { fails += 1; print("FAIL: \(what)") } }
-  // 使用者機器：BenQ(1) 主、ASUS(2) 在左、FHD(3) 在下
-  let r: [ID: R] = [1: R(x: 0, y: 0, w: 2560, h: 1440), 2: R(x: -1920, y: 200, w: 1920, h: 1080),
-                    3: R(x: 320, y: 1440, w: 1920, h: 1080)]
-  let d = derive(r, root: 1)!
-  check(d.order.first == 1 && Set(d.order) == [1, 2, 3], "order")
-  check(d.links[2]?.parent == 1 && d.links[2]?.side == .left && d.links[2]?.anchor == 740, "ASUS link")
-  check(d.links[3]?.parent == 1 && d.links[3]?.side == .below && d.links[3]?.anchor == 1280, "FHD link")
-  var off = offsets(r, d.links)
-  check(layout(d.order, d.links, r, off) == r, "layout 還原原排列")
-  check(valid(r, d.links), "原排列有效")
-  off[2]! += 100
-  let moved = layout(d.order, d.links, r, off), l2 = d.links[2]!
-  check(along(moved[1]!, l2.side) + l2.anchor - along(moved[2]!, l2.side) == l2.anchor - off[2]!, "線位置 = anchor - off")
-  check(valid(layout(d.order, d.links, r, off), d.links), "ASUS 下移 100 有效")
-  off[2]! += 500
-  check(!valid(layout(d.order, d.links, r, off), d.links), "參考線出 ASUS 範圍要拒絕")
-  check(derive([1: R(x: 0, y: 0, w: 10, h: 10), 2: R(x: 10, y: 10, w: 10, h: 10)], root: 1) == nil, "只碰角不連通")
-  check(derive([1: R(x: 0, y: 0, w: 10, h: 10), 2: R(x: 50, y: 0, w: 10, h: 10)], root: 1) == nil, "有縫不連通")
-  check(!valid([1: R(x: 0, y: 0, w: 10, h: 10), 2: R(x: 5, y: 5, w: 10, h: 10)], [:]), "重疊無效")
-  // 排列：FHD 貼到 ASUS 下方 → parent 變 ASUS
-  let a = arranged(r, order: d.order, links: d.links, a: 3, side: .below, b: 2)!
-  check(a.links[3]?.parent == 2 && a.links[3]?.side == .below, "排列後 FHD 掛 ASUS 下（寫死，不被 BFS 改回 BenQ）")
-  check(stillValid(a.rects, order: a.order, links: a.links, root: 1), "排列結果 stillValid")
-  check(arranged(r, order: d.order, links: d.links, a: 2, side: .above, b: 3) == nil, "ASUS 搬到 FHD 上方會與 BenQ 重疊或斷線")
-  // 主螢幕被搬走時整體平移回 (0,0)
-  check(arranged(r, order: d.order, links: d.links, a: 1, side: .right, b: 2) == nil, "搬主螢幕壓到 FHD 要拒絕")
-  let two: [ID: R] = [1: r[1]!, 2: r[2]!], d3 = derive(two, root: 1)!
-  let m = arranged(two, order: d3.order, links: d3.links, a: 1, side: .right, b: 2)!.rects
-  check(m[1] == R(x: 0, y: 0, w: 2560, h: 1440) && m[2] == R(x: -1920, y: 0, w: 1920, h: 1080), "主螢幕回 (0,0) 並整體平移")
-  // 內建在下、HP 與 LEN 並排在上：兩台都直接掛內建，且調整時 parent／anchor 不變
+  let eps: CGFloat = 1e-6
+  // Built-in(1) 在下，HP(2) 與 LEN(3) 並排在上，HP 右緣 642 剛好貼 LEN 左緣
   let u: [ID: R] = [1: R(x: 0, y: 0, w: 1470, h: 956), 3: R(x: 642, y: -1080, w: 1920, h: 1080),
                     2: R(x: -1278, y: -1080, w: 1920, h: 1080)]
-  let du = derive(u, root: 1)!
-  check(du.links[2]?.parent == 1 && du.links[3]?.parent == 1 && du.links[2]?.side == .above, "HP、LEN 都掛 Built-in")
-  var ou = offsets(u, du.links)
-  ou[3]! += 400
-  let lu = layout(du.order, du.links, u, ou)
-  check(valid(lu, du.links) && stillValid(lu, order: du.order, links: du.links, root: 1), "LEN 右移後 links 仍成立")
-  var cl = du.links; cl[2] = Link(parent: 3, side: .left, anchor: 540)
-  check(topo(1, cl) == [1, 3, 2], "HP 改掛 LEN 後 topo 排序")
-  cl[3] = Link(parent: 2, side: .right, anchor: 540)
-  check(topo(1, cl) == nil, "互為 parent 成環要擋")
-  var oh = offsets(u, du.links); oh[2]! -= 1300
-  check(!valid(layout(du.order, du.links, u, oh), du.links), "HP 左移到參考線出範圍要擋")
-  oh = offsets(u, du.links); oh[2]! += 1
-  check(!valid(layout(du.order, du.links, u, oh), du.links), "HP 右移撞到 LEN 要擋")
   let pt: [ID: CGFloat] = [1: 5.06, 3: 3.61, 2: 4.00]
-  let eps: CGFloat = 1e-6
-  let eu = makeEdges(u, du.links, [])
-  let atRef = crossPoint(eu, u, pt, from: 1, to: 3, at: CGPoint(x: 1056, y: 5))
-  check(atRef == CGPoint(x: 1056, y: -3), "參考點跨界不偏移，落在 LEN 內側 2 pt")
+  let pu = derivePairs(u, keep: [])
+  check(pu.count == 3, "三台各自相鄰得 3 組（沒有 tree 排除）")
+  check(pu.contains(Pair(a: 2, b: 1, side: .below, refA: 1599, refB: 321)), "HP 在 Built-in 上方，參考線取重疊中點")
+  check(pu.contains(Pair(a: 3, b: 1, side: .below, refA: 414, refB: 1056)), "LEN 在 Built-in 上方")
+  check(pu.contains(Pair(a: 2, b: 3, side: .right, refA: 540, refB: 540)), "HP↔LEN 貼合也成組")
+  let eu = makeEdges(pu)
+  check(eu.count == 6, "每組雙向兩筆")
+  check(crossPoint(eu, u, pt, from: 1, to: 3, at: CGPoint(x: 1056, y: 5)) == CGPoint(x: 1056, y: -3), "參考點跨界不偏移，落在 LEN 內側 2 pt")
   let off100 = crossPoint(eu, u, pt, from: 1, to: 3, at: CGPoint(x: 1156, y: 5))!
   check(abs(off100.x - (1056 + 100 * 3.61 / 5.06)) < eps, "離參考點 100 pt 依 pt/mm 比例換算")
   let back = crossPoint(eu, u, pt, from: 3, to: 1, at: CGPoint(x: off100.x, y: -5))!
   check(abs(back.x - 1156) < eps && back.y == 2, "來回換算還原，落在 Built-in 內側")
   check(crossPoint(eu, u, pt, from: 1, to: 3, at: CGPoint(x: 0, y: 5)) == nil, "換算後出 LEN 範圍要放行")
   check(crossPoint(eu, u, pt, from: 1, to: 3, at: CGPoint(x: 0, y: 5), slackMM: 600) != nil, "容許範圍內夾進 LEN")
-  check(crossPoint(eu, u, pt, from: 2, to: 3, at: CGPoint(x: 641, y: -500)) == nil, "HP↔LEN 非 tree 鄰居不處理")
-  check(Set(neighbors(eu, 1).map { $0.id }) == [2, 3] && neighbors(eu, 3).first?.edge == .below, "neighbors")
-  // 配對：HP(2)、LEN(3) 都掛 Built-in，中間有縫（HP 右緣 642、LEN 左緣 907）
+  check(crossPoint(eu, u, pt, from: 2, to: 3, at: CGPoint(x: 641, y: -540)) == CGPoint(x: 644, y: -540), "HP→LEN（無縫）參考點不偏移")
+  check(Set(neighbors(eu, 1).map { $0.id }) == [2, 3] && neighbors(eu, 3).contains { $0.id == 1 && $0.edge == .below }, "neighbors")
+  // 配對：HP、LEN 中間有縫（HP 右緣 642、LEN 左緣 907）
   let ug: [ID: R] = [1: u[1]!, 2: u[2]!, 3: R(x: 907, y: -1080, w: 1920, h: 1080)]
-  let dg = derive(ug, root: 1)!
-  let pr = derivePairs(ug, dg.links, keep: [])
-  check(pr == [Pair(a: 2, b: 3, side: .right, refA: 540, refB: 540)], "HP↔LEN 配對，預設取重疊中點")
-  var eg = makeEdges(ug, dg.links, pr)
-  check(crossPoint(eg, ug, pt, from: 2, to: 3, at: CGPoint(x: 640, y: -540)) == CGPoint(x: 909, y: -540), "HP→LEN 參考點不偏移")
-  var pk = pr; pk[0].refB = 580
-  eg = makeEdges(ug, dg.links, pk)
+  let hl = Pair(a: 2, b: 3, side: .right, refA: 540, refB: 540)
+  let pr = derivePairs(ug, keep: [])
+  check(pr.contains(hl), "HP↔LEN 有縫仍成組，預設取重疊中點")
+  var pk = [hl]; pk[0].refB = 580
+  let eg = makeEdges(pk)
   check(crossPoint(eg, ug, pt, from: 2, to: 3, at: CGPoint(x: 640, y: -540)) == CGPoint(x: 909, y: -500), "refB 調成 580 後同點落 -500")
   let far = crossPoint(eg, ug, pt, from: 2, to: 3, at: CGPoint(x: 640, y: -440))!
   check(abs(far.y - (-1080 + 580 + 100 * 3.61 / 4)) < eps, "離參考點 100 pt 依 pt/mm 比例")
   let back2 = crossPoint(eg, ug, pt, from: 3, to: 2, at: CGPoint(x: 909, y: -500))!
   check(abs(back2.y - (-540)) < eps && back2.x == 639, "LEN→HP 還原，落在 HP 右緣內側")
-  check(derivePairs(ug, dg.links, keep: pk) == pk, "合法的舊值沿用")
+  check(derivePairs(ug, keep: pk).contains(pk[0]), "合法的舊值沿用")
   var bad = pk; bad[0].refB = 99999
-  check(derivePairs(ug, dg.links, keep: bad) == pr, "範圍外的舊值丟棄，回預設")
+  check(derivePairs(ug, keep: bad).contains(hl), "範圍外的舊值丟棄，回預設")
   var ug4 = ug; ug4[4] = R(x: 650, y: -1080, w: 200, h: 1080)
-  check(!derivePairs(ug4, dg.links, keep: []).contains { $0.a == 2 && $0.b == 3 }, "縫中有第三台就不成對")
+  check(!derivePairs(ug4, keep: []).contains { $0.a == 2 && $0.b == 3 }, "縫中有第三台就不成對")
   var ugf = ug; ugf[3] = R(x: 2640, y: -1080, w: 1920, h: 1080)
-  check(derivePairs(ugf, dg.links, keep: []).isEmpty, "空隙超過螢幕寬不成對")
-  let ur: [ID: R] = [1: u[1]!, 5: u[2]!, 3: ug[3]!], dr = derive(ur, root: 1)!
-  check(derivePairs(ur, dr.links, keep: []).first.map { $0.a == 5 && $0.b == 3 && $0.side == .right } == true, "id 順序相反仍是 a 在左")
+  check(!derivePairs(ugf, keep: []).contains { $0.a == 2 && $0.b == 3 }, "空隙超過螢幕寬不成對")
+  check(derivePairs([1: R(x: 0, y: 0, w: 10, h: 10), 2: R(x: 10, y: 10, w: 10, h: 10)], keep: []).isEmpty, "只碰角不成組")
+  let ur: [ID: R] = [1: u[1]!, 5: u[2]!, 3: ug[3]!]
+  check(derivePairs(ur, keep: []).contains { $0.a == 5 && $0.b == 3 && $0.side == .right }, "id 順序相反仍是 a 在左")
+  check(derivePairs([:], keep: []).isEmpty && derivePairs([1: u[1]!], keep: []).isEmpty, "0 台、1 台不 crash")
   let sh = ug.mapValues { R(x: $0.x + 100, y: $0.y + 50, w: $0.w, h: $0.h) }
-  check(crossPoint(makeEdges(sh, dg.links, pk), sh, pt, from: 2, to: 3, at: CGPoint(x: 740, y: -490)) == CGPoint(x: 1009, y: -450), "整體平移：區域 ref 不變，結果跟著平移")
-  let te = makeEdges(ug, dg.links, []).first { $0.a == 1 && $0.b == 3 }!
-  check(te.refA == CGFloat(dg.links[3]!.anchor) && te.refB == CGFloat(dg.links[3]!.anchor - offsets(ug, dg.links)[3]!), "tree 邊 refB = anchor - off")
+  check(crossPoint(makeEdges(pk), sh, pt, from: 2, to: 3, at: CGPoint(x: 740, y: -490)) == CGPoint(x: 1009, y: -450), "整體平移：區域 ref 不變，結果跟著平移")
+  // 角落斜推：右分量大先試右，下分量大先試下
+  let rc = R(x: 0, y: 0, w: 100, h: 100), nb: [(id: ID, edge: Side)] = [(7, .below), (8, .right)]
+  check(pushOrder(rc, CGPoint(x: 99, y: 99), nb, dx: 3, dy: 1).map { $0.id } == [8, 7], "角落往右下斜推，右分量大先試右")
+  check(pushOrder(rc, CGPoint(x: 99, y: 99), nb, dx: 1, dy: 3).map { $0.id } == [7, 8], "下分量大先試下")
+  check(pushOrder(rc, CGPoint(x: 50, y: 50), nb, dx: 3, dy: 3).isEmpty, "沒貼邊不算推")
+  // 校正檔 v2
+  let base: [ID: String] = [1: "1-2-0", 2: "1-2-0", 3: "9-9-9"]
+  let ku = uniqueKeys(base, [1: R(x: 2560, y: 0, w: 10, h: 10), 2: R(x: 0, y: 0, w: 10, h: 10), 3: R(x: -100, y: 0, w: 10, h: 10)])
+  check(ku[2] == "1-2-0#1" && ku[1] == "1-2-0#2" && ku[3] == "9-9-9", "key 撞號依位置加後綴，不撞的不動")
+  let tg = calTags([1: "a", 2: "b", 3: "c"], ug)
+  check(tg[3] == "c/1920x1080" && tg[1] == "a/1470x956", "tag = key/解析度")
+  let live = Dictionary(uniqueKeysWithValues: tg.map { ($1, $0) })
+  let saved = [CalPair(a: tg[2]!, b: tg[3]!, side: .right, refA: 540, refB: 580)]
+  check(matchCalib(saved, live: live) == [Pair(a: 2, b: 3, side: .right, refA: 540, refB: 580)], "校正檔對回目前螢幕")
+  var tg2 = tg; tg2[3] = "c/1280x720"
+  check(matchCalib(saved, live: Dictionary(uniqueKeysWithValues: tg2.map { ($1, $0) })).isEmpty, "解析度改了不吻合")
+  var moved = ug; moved[3] = R(x: 1000, y: -1060, w: 1920, h: 1080)
+  check(derivePairs(moved, keep: matchCalib(saved, live: live)).contains(Pair(a: 2, b: 3, side: .right, refA: 540, refB: 580)), "系統設定移動排列後校正仍沿用")
+  check(decodeCalib(encodeCalib(saved)) == saved, "v2 JSON 來回一致")
+  check(decodeCalib(Data(#"{"entries":[],"pairs":[{"a":"x","b":"y","side":"right","refA":1,"refB":2}]}"#.utf8)).isEmpty, "舊格式（#5）忽略")
+  check(decodeCalib(Data(#"[{"tag":"x"}]"#.utf8)).isEmpty && decodeCalib(Data("壞掉".utf8)).isEmpty, "舊陣列格式與壞檔忽略")
+  let other = CalPair(a: "x", b: "y", side: .below, refA: 1, refB: 2), upd = CalPair(a: tg[2]!, b: tg[3]!, side: .right, refA: 1, refB: 2)
+  check(mergeCalib(saved + [other], [upd]) == [other, upd], "合併：覆蓋同兩台、保留沒接著的")
   check(scale(2560, 1440, CGSize(width: 597, height: 336)) != nil, "scale 正常")
   check(scale(1440, 2560, CGSize(width: 597, height: 336)) != nil, "scale 旋轉")
   check(scale(1920, 1080, .zero) == nil, "scale mm=0")
@@ -342,20 +250,16 @@ func selftest() -> Never {
 
 // MARK: - 讀系統狀態
 
-struct Failure: Error { let msg: String }
+struct Failure: Error, CustomStringConvertible { let msg: String; var description: String { msg } }
 
 struct Model {
-  var rects: [ID: R]            // 系統目前實際的 rect
+  var rects: [ID: R]
   var ptmm: [ID: CGFloat]
   var names: [ID: String]
-  var num: [ID: Int]            // 畫面編號：主螢幕 1，其餘依 ID 排序
-  var order: [ID]
-  var links: [ID: Link]
-  var off: [ID: Int]            // 調整中的沿邊偏移（未套用）
-  var calibrated = false        // links 來自校正檔
-  var pairs: [Pair] = []
-  var edges: [Edge] = []        // glide 用：由 rects／links／pairs 建好，不含互動模式未套用的調整
-  var kids: [ID] { Array(order.dropFirst()) }
+  var tags: [ID: String]        // 校正檔用的 key/解析度
+  var pairs: [Pair]
+  var edges: [Edge]
+  var uncal: Int                // 還沒校正（用預設中點）的組數
 }
 
 func displayIDs(online: Bool) -> [ID] {
@@ -370,51 +274,18 @@ func screenID(_ s: NSScreen) -> ID? {
   (s.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
 }
 
-// MARK: - 校正檔（參考點 anchor 校完後無法從 rects 推回，必須存）
-
 let calibDir = NSHomeDirectory() + "/.config/monitor-align"
-let calibPath = calibDir + "/calib.json", lockPath = calibDir + "/calibrating"
+let calibPath = calibDir + "/calib.json"
 
-/// 同型號螢幕靠 rect 區分；換插孔 DisplayID 會變，所以不用 ID
-func tag(_ id: ID, _ r: R) -> String {
-  "\(CGDisplayVendorNumber(id))-\(CGDisplayModelNumber(id))-\(CGDisplaySerialNumber(id))@\(r.x),\(r.y),\(r.w)x\(r.h)"
-}
-struct CalEntry: Codable { let tag: String; let parent: String?; let side: Side?; let anchor: Int? }
-struct CalPair: Codable { let a: String; let b: String; let side: Side; let refA: Int; let refB: Int }
-struct CalFile: Codable { let entries: [CalEntry]; let pairs: [CalPair] }
+func readCalib() -> [CalPair] { FileManager.default.contents(atPath: calibPath).map(decodeCalib) ?? [] }
 
-func writeCalib(_ rects: [ID: R], _ order: [ID], _ links: [ID: Link], _ pairs: [Pair]) {
-  let es = order.map { id in
-    CalEntry(tag: tag(id, rects[id]!), parent: links[id].map { tag($0.parent, rects[$0.parent]!) },
-             side: links[id]?.side, anchor: links[id]?.anchor)
-  }
-  let ps = pairs.map { CalPair(a: tag($0.a, rects[$0.a]!), b: tag($0.b, rects[$0.b]!), side: $0.side, refA: $0.refA, refB: $0.refB) }
+func writeCalib(_ pairs: [CalPair]) {
   try? FileManager.default.createDirectory(atPath: calibDir, withIntermediateDirectories: true)
-  try? JSONEncoder().encode(CalFile(entries: es, pairs: ps)).write(to: URL(fileURLWithPath: calibPath))
+  try? encodeCalib(pairs).write(to: URL(fileURLWithPath: calibPath), options: .atomic)
 }
 
-/// 檔案與目前所有螢幕（tag 含 rect）完全吻合才採用。舊格式（純陣列）視為沒有配對；配對的 ref 是否合法交給 derivePairs 判斷
-func readCalib(_ rects: [ID: R], root: ID) -> (order: [ID], links: [ID: Link], pairs: [Pair])? {
-  guard let data = FileManager.default.contents(atPath: calibPath) else { return nil }
-  let dec = JSONDecoder()
-  let file = (try? dec.decode(CalFile.self, from: data))
-    ?? (try? dec.decode([CalEntry].self, from: data)).map { CalFile(entries: $0, pairs: []) }
-  guard let f = file else { return nil }
-  let ids = Dictionary(rects.map { (tag($0.key, $0.value), $0.key) }, uniquingKeysWith: { a, _ in a })
-  guard f.entries.count == rects.count, Set(f.entries.map { $0.tag }) == Set(ids.keys) else { return nil }
-  var links: [ID: Link] = [:]
-  for e in f.entries {
-    guard let c = ids[e.tag], let p = e.parent.flatMap({ ids[$0] }), let s = e.side, let a = e.anchor else { continue }
-    links[c] = Link(parent: p, side: s, anchor: a)
-  }
-  let pairs = f.pairs.compactMap { c -> Pair? in
-    guard let a = ids[c.a], let b = ids[c.b] else { return nil }
-    return Pair(a: a, b: b, side: c.side, refA: c.refA, refB: c.refB)
-  }
-  return topo(root, links).map { ($0, links, pairs) }
-}
-
-func load(keeping: (order: [ID], links: [ID: Link])? = nil, keepPairs: [Pair]? = nil) throws -> Model {
+/// 讀系統螢幕與校正檔。不能用就丟 Failure（app 模式顯示在狀態行，不退出）
+func load() throws -> Model {
   if displayIDs(online: true).contains(where: { CGDisplayIsInMirrorSet($0) != 0 }) {
     throw Failure(msg: "偵測到鏡像螢幕，請先到系統設定關閉鏡像")
   }
@@ -422,87 +293,71 @@ func load(keeping: (order: [ID], links: [ID: Link])? = nil, keepPairs: [Pair]? =
   guard ids.count > 1 else { throw Failure(msg: "需要至少兩台螢幕") }
   var names: [ID: String] = [:]
   for s in NSScreen.screens { if let id = screenID(s) { names[id] = s.localizedName } }
-  var rects: [ID: R] = [:], ptmm: [ID: CGFloat] = [:]
+  var rects: [ID: R] = [:], ptmm: [ID: CGFloat] = [:], base: [ID: String] = [:]
   for id in ids {
     let b = CGDisplayBounds(id), name = names[id] ?? "螢幕\(id)"
     names[id] = name
     let r = R(x: Int(b.minX), y: Int(b.minY), w: Int(b.width), h: Int(b.height))
-    guard let s = scale(r.w, r.h, CGDisplayScreenSize(id)) else {
-      let mm = CGDisplayScreenSize(id)
-      throw Failure(msg: "\(name) 回報的實體尺寸不合理（\(mm.width)x\(mm.height) mm，解析度 \(r.w)x\(r.h)），無法對齊")
+    let mm = CGDisplayScreenSize(id)
+    guard let s = scale(r.w, r.h, mm) else {
+      throw Failure(msg: "\(name) 回報的實體尺寸不合理（\(mm.width)x\(mm.height) mm，解析度 \(r.w)x\(r.h)）")
     }
     rects[id] = r; ptmm[id] = s
+    base[id] = "\(CGDisplayVendorNumber(id))-\(CGDisplayModelNumber(id))-\(CGDisplaySerialNumber(id))"
   }
-  let root = CGMainDisplayID()
-  var d: (order: [ID], links: [ID: Link]), cal = false
-  let file = keeping == nil ? readCalib(rects, root: root) : nil
-  let kept = keeping ?? file.map { ($0.order, $0.links) }
-  if let k = kept, stillValid(rects, order: k.order, links: k.links, root: root) {
-    d = k                                       // 沿用：parent／anchor 不因重疊長度變動而換
-    cal = file != nil
-  } else if let n = derive(rects, root: root) {
-    d = n
-  } else {
-    throw Failure(msg: "螢幕排列不連通（需要邊相接），請先到系統設定修正")
-  }
-  var num = [root: 1]
-  for (i, id) in ids.filter({ $0 != root }).sorted().enumerated() { num[id] = i + 2 }
-  let pairs = derivePairs(rects, d.links, keep: keepPairs ?? file?.pairs ?? [])
-  return Model(rects: rects, ptmm: ptmm, names: names, num: num, order: d.order, links: d.links,
-               off: offsets(rects, d.links), calibrated: cal, pairs: pairs, edges: makeEdges(rects, d.links, pairs))
+  let tags = calTags(base, rects)
+  let saved = matchCalib(readCalib(), live: Dictionary(tags.map { ($1, $0) }, uniquingKeysWith: { a, _ in a }))
+  let pairs = derivePairs(rects, keep: saved)
+  guard !pairs.isEmpty else { throw Failure(msg: "沒有相鄰的螢幕組（要邊相接，或只隔一小段縫）") }
+  return Model(rects: rects, ptmm: ptmm, names: names, tags: tags, pairs: pairs, edges: makeEdges(pairs),
+               uncal: pairs.filter { !saved.contains($0) }.count)
 }
 
-func cm(_ pt: Int, _ id: ID) -> String { String(format: "%.1f cm", Double(pt) / Double(M.ptmm[id]!) / 10) }
+func cm(_ pt: Int, _ id: ID, _ m: Model) -> String { String(format: "%.1f cm", Double(pt) / Double(m.ptmm[id]!) / 10) }
 
-let args = CommandLine.arguments
-if args.contains("--selftest") { selftest() }
-
-var M: Model
-do { M = try load() } catch let e as Failure { print(e.msg); exit(1) } catch { exit(1) }
-
-if args.contains("--dump") {
-  for id in M.order {
-    let r = M.rects[id]!, l = M.links[id]
-    let rel = l.map { "parent=\(M.names[$0.parent]!) side=\($0.side) anchor=\($0.anchor)pt(\(cm($0.anchor, $0.parent)))" } ?? "root"
-    print("#\(M.num[id]!) \(M.names[id]!) id=\(id) (\(r.x),\(r.y)) \(r.w)x\(r.h) \(String(format: "%.2f", M.ptmm[id]!))pt/mm \(rel)")
-  }
-  for p in M.pairs {
-    print("配對 \(M.names[p.a]!) ↔ \(M.names[p.b]!) side=\(p.side) refA=\(p.refA)pt(\(cm(p.refA, p.a))) refB=\(p.refB)pt(\(cm(p.refB, p.b)))")
-  }
-  print(M.calibrated ? "校正檔：使用 \(calibPath)" : "校正檔：無或與目前排列不符（參考點取重疊中點）")
-  exit(0)
+func dump() -> Never {
+  do {
+    let m = try load()
+    for id in m.rects.keys.sorted() {
+      let r = m.rects[id]!
+      print("\(m.names[id]!) id=\(id) key=\(m.tags[id]!) (\(r.x),\(r.y)) \(r.w)x\(r.h) \(String(format: "%.2f", m.ptmm[id]!))pt/mm")
+    }
+    for p in m.pairs {
+      print("相鄰 \(m.names[p.a]!) → \(m.names[p.b]!) side=\(p.side) refA=\(p.refA)pt(\(cm(p.refA, p.a, m))) refB=\(p.refB)pt(\(cm(p.refB, p.b, m)))")
+    }
+    print("未校正 \(m.uncal) 組；校正檔 \(calibPath)")
+    exit(0)
+  } catch { print("\(error)"); exit(1) }
 }
 
 // MARK: - 常駐：游標跨螢幕依實體公釐換算
 
-var glideLast: CGPoint?, glidePush: CGFloat = 0, glideSkip = false, glideOn = true
+var M: Model?                      // nil = 不支援（原因在 loadError），游標一律放行
+var loadError: String?
+var glidePaused = false            // 使用者在選單暫停
+var calibrating = false            // 校正中暫停
+var glideLast: CGPoint?, glidePush: CGFloat = 0, glideSkip = false
 var glideTap: CFMachPort?
 
-/// 貼著 a 的 e 邊、且朝外的 delta（pt）；不貼邊回 0
-func outward(_ r: R, _ p: CGPoint, _ e: Side, dx: CGFloat, dy: CGFloat) -> CGFloat {
-  switch e {
-  case .left: return p.x <= CGFloat(r.x + 1) ? max(0, -dx) : 0
-  case .right: return p.x >= CGFloat(r.maxX - 2) ? max(0, dx) : 0
-  case .above: return p.y <= CGFloat(r.y + 1) ? max(0, -dy) : 0
-  case .below: return p.y >= CGFloat(r.maxY - 2) ? max(0, dy) : 0
-  }
+func reloadModel() {
+  do { M = try load(); loadError = nil } catch { M = nil; loadError = "\(error)" }
 }
 
 func glideStep(_ ev: CGEvent) {
   let p = ev.location, last = glideLast
   glideLast = p
   if glideSkip { glideSkip = false; return }                  // warp 後第一個事件的 delta 不可靠
-  guard glideOn, !FileManager.default.fileExists(atPath: lockPath), let q = last,
-        let a = M.rects.first(where: { $0.value.has(q) })?.key else { return }
+  guard !glidePaused, !calibrating, let m = M, let q = last,
+        let a = m.rects.first(where: { $0.value.has(q) })?.key else { return }
   var target: CGPoint?
-  if let b = M.rects.first(where: { $0.value.has(p) })?.key, b != a {
-    target = crossPoint(M.edges, M.rects, M.ptmm, from: a, to: b, at: q)       // 系統自己跨過去：換算沿邊位置
+  if let b = m.rects.first(where: { $0.value.has(p) })?.key, b != a {
+    target = crossPoint(m.edges, m.rects, m.ptmm, from: a, to: b, at: q)       // 系統自己跨過去：換算沿邊位置
   } else {                                                                      // 卡在邊上往外推：pt 沒接、實體有接
     let dx = CGFloat(ev.getDoubleValueField(.mouseEventDeltaX)), dy = CGFloat(ev.getDoubleValueField(.mouseEventDeltaY))
-    let hits = neighbors(M.edges, a).map { ($0, outward(M.rects[a]!, p, $0.edge, dx: dx, dy: dy)) }.filter { $0.1 > 0 }
-    glidePush = hits.isEmpty ? 0 : glidePush + hits.map { $0.1 }.max()!
+    let hits = pushOrder(m.rects[a]!, p, neighbors(m.edges, a), dx: dx, dy: dy)
+    glidePush = hits.isEmpty ? 0 : glidePush + hits[0].push
     if glidePush > 8 {            // 同側有多個鄰居時依序試，取第一個換算得出來的
-      target = hits.lazy.compactMap { crossPoint(M.edges, M.rects, M.ptmm, from: a, to: $0.0.id, at: p, slackMM: 30) }.first
+      target = hits.lazy.compactMap { crossPoint(m.edges, m.rects, m.ptmm, from: a, to: $0.id, at: p, slackMM: 30) }.first
     }
   }
   guard let t = target else { return }
@@ -511,16 +366,7 @@ func glideStep(_ ev: CGEvent) {
   CGWarpMouseCursorPosition(t)
 }
 
-func glideReload() {
-  do { M = try load(); glideOn = true } catch { glideOn = false }
-}
-
-func runGlide() -> Never {
-  guard AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary) else {
-    print("需要輔助使用權限：系統設定 → 隱私權與安全性 → 輔助使用，允許此程式後重新執行（重新編譯後可能要重新授權）")
-    exit(1)
-  }
-  if !M.calibrated { print("警告：沒有校正檔或與目前排列不符，參考點取重疊中點。請先執行 monitor-align 校正並套用") }
+func makeTap() {
   CGEventSource(stateID: .combinedSessionState)?.localEventsSuppressionInterval = 0
   let cb: CGEventTapCallBack = { _, type, ev, _ in
     if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
@@ -529,102 +375,33 @@ func runGlide() -> Never {
     return Unmanaged.passUnretained(ev)
   }
   guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
-                                    eventsOfInterest: 1 << CGEventType.mouseMoved.rawValue, callback: cb, userInfo: nil) else {
-    print("無法建立 event tap（輔助使用權限未生效？）"); exit(1)
-  }
+                                    eventsOfInterest: 1 << CGEventType.mouseMoved.rawValue, callback: cb, userInfo: nil) else { return }
   glideTap = tap
   CFRunLoopAddSource(CFRunLoopGetMain(), CFMachPortCreateRunLoopSource(nil, tap, 0), .commonModes)
-  var mtime = (try? FileManager.default.attributesOfItem(atPath: calibPath)[.modificationDate]) as? Date
-  Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in           // 校正檔更新就重讀，停用中也能自己恢復
-    let m = (try? FileManager.default.attributesOfItem(atPath: calibPath)[.modificationDate]) as? Date
-    if m != mtime { mtime = m; glideReload() }
-  }
-  NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil,
-                                         queue: .main) { _ in
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { glideReload() }
-  }
-  print("glide 執行中（\(M.names.count) 台螢幕）。Ctrl-C 離開；校正模式開著時自動暫停")
-  let app = NSApplication.shared; app.setActivationPolicy(.prohibited); app.run()
-  exit(0)
 }
-if args.contains("--glide") { runGlide() }
 
-// MARK: - 畫面
+// MARK: - 校正畫面
 
 struct Mark { var horizontal: Bool; var pos: CGFloat; var text: String; var width: CGFloat }
 
-/// 排列示意圖中一台螢幕的角色：normal 一般、mover 要搬的、target 貼靠的、ghost 搬完後的預覽
-enum Role { case normal, mover, target, ghost }
-struct MapItem { let num: Int; let name: String; let r: R; let role: Role }
-
 final class V: NSView {
-  var pm: CGFloat = 1
-  var badge = ""
   var marks: [Mark] = []
-  var map: [MapItem] = []              // 非空 = 排列模式，在螢幕中央畫縮小的排列示意圖
-  var hints: [String] = []
-  var banner = "", bannerBG = NSColor.black
+  var badge = "", banner = "", hints: [String] = []
   override var isFlipped: Bool { true }
-  func t(_ s: String, _ p: NSPoint, _ bg: NSColor, size: CGFloat = 13) {
+  func label(_ s: String, _ size: CGFloat, _ bg: NSColor) -> NSAttributedString {
     NSAttributedString(string: " \(s) ", attributes: [.font: NSFont.boldSystemFont(ofSize: size),
-      .foregroundColor: NSColor.white, .backgroundColor: bg]).draw(at: p)
+      .foregroundColor: NSColor.white, .backgroundColor: bg])
   }
+  func t(_ s: String, _ p: NSPoint, _ bg: NSColor, size: CGFloat = 13) { label(s, size, bg).draw(at: p) }
   func line(_ a: NSPoint, _ b: NSPoint, _ c: NSColor, _ w: CGFloat) {
     c.setStroke(); let p = NSBezierPath(); p.move(to: a); p.line(to: b); p.lineWidth = w; p.stroke()
   }
-  func centered(_ s: String, in rc: NSRect, size: CGFloat, color: NSColor = .white) {
-    let a = NSAttributedString(string: s, attributes: [.font: NSFont.boldSystemFont(ofSize: size), .foregroundColor: color])
-    let z = a.size()
-    a.draw(at: NSPoint(x: rc.midX - z.width / 2, y: rc.midY - z.height / 2))
-  }
-  func drawMap() {
-    guard !map.isEmpty else { return }
-    let minX = map.map { $0.r.x }.min()!, minY = map.map { $0.r.y }.min()!
-    let spanX = CGFloat(map.map { $0.r.maxX }.max()! - minX), spanY = CGFloat(map.map { $0.r.maxY }.max()! - minY)
-    let box = NSRect(x: bounds.midX - 330, y: bounds.midY - 230, width: 660, height: 460)
-    NSColor.black.withAlphaComponent(0.9).setFill()
-    NSBezierPath(roundedRect: box, xRadius: 16, yRadius: 16).fill()
-    let area = NSRect(x: box.minX + 40, y: box.minY + 30, width: box.width - 80, height: box.height - 150)
-    let k = min(area.width / spanX, area.height / spanY)
-    let ox = area.midX - spanX * k / 2, oy = area.midY - spanY * k / 2
-    for it in map {
-      let rc = NSRect(x: ox + CGFloat(it.r.x - minX) * k, y: oy + CGFloat(it.r.y - minY) * k,
-                      width: CGFloat(it.r.w) * k, height: CGFloat(it.r.h) * k).insetBy(dx: 2, dy: 2)
-      let color: NSColor
-      switch it.role {
-      case .normal: color = .lightGray
-      case .mover: color = .yellow
-      case .target: color = .green
-      case .ghost: color = .orange
-      }
-      let path = NSBezierPath(rect: rc)
-      color.withAlphaComponent(it.role == .normal ? 0.25 : 0.5).setFill(); path.fill()
-      color.setStroke(); path.lineWidth = 3
-      if it.role == .ghost { path.setLineDash([8, 5], count: 2, phase: 0) }
-      path.stroke()
-      centered("\(it.num)", in: rc.offsetBy(dx: 0, dy: -12), size: min(44, max(16, rc.height * 0.4)))
-      centered(it.name, in: rc.offsetBy(dx: 0, dy: 20), size: 12)
-    }
-    for (i, h) in hints.enumerated() {
-      centered(h, in: NSRect(x: box.minX, y: box.maxY - 100 + CGFloat(i) * 34, width: box.width, height: 30),
-               size: i == hints.count - 1 ? 18 : 14, color: i == hints.count - 1 ? .cyan : .white)
-    }
+  func centered(_ s: String, y: CGFloat, size: CGFloat, bg: NSColor) {
+    let a = label(s, size, bg)
+    a.draw(at: NSPoint(x: bounds.midX - a.size().width / 2, y: y))
   }
   override func draw(_ r: NSRect) {
     let W = bounds.width, H = bounds.height
-    let bg = NSColor.black.withAlphaComponent(0.7)
-    for c in 0...Int(H / (10 * pm)) {                        // 左右邊緣：離上緣幾公分
-      let y = CGFloat(c * 10) * pm, len: CGFloat = c % 5 == 0 ? 60 : 30
-      line(NSPoint(x: 0, y: y), NSPoint(x: len, y: y), .cyan, 2)
-      line(NSPoint(x: W, y: y), NSPoint(x: W - len, y: y), .cyan, 2)
-      t("\(c)", NSPoint(x: 64, y: y - 9), bg); t("\(c)", NSPoint(x: W - 100, y: y - 9), bg)
-    }
-    for c in 0...Int(W / (10 * pm)) {                        // 上下邊緣：離左緣幾公分
-      let x = CGFloat(c * 10) * pm, len: CGFloat = c % 5 == 0 ? 60 : 30
-      line(NSPoint(x: x, y: 0), NSPoint(x: x, y: len), .yellow, 2)
-      line(NSPoint(x: x, y: H), NSPoint(x: x, y: H - len), .yellow, 2)
-      t("\(c)", NSPoint(x: x - 12, y: 64), bg); t("\(c)", NSPoint(x: x - 12, y: H - 90), bg)
-    }
     for m in marks {
       if m.horizontal {
         line(NSPoint(x: 0, y: m.pos), NSPoint(x: W, y: m.pos), .red, m.width)
@@ -634,301 +411,237 @@ final class V: NSView {
         t(m.text, NSPoint(x: m.pos + 8, y: H / 2), .red)
       }
     }
-    t(badge, NSPoint(x: W / 2 - 80, y: 100), NSColor.blue.withAlphaComponent(0.8), size: 28)
-    drawMap()
-    let b = NSAttributedString(string: " \(banner) ", attributes: [.font: NSFont.boldSystemFont(ofSize: 22),
-      .foregroundColor: NSColor.white, .backgroundColor: bannerBG])
-    b.draw(at: NSPoint(x: W / 2 - b.size().width / 2, y: 30))
+    t(badge, NSPoint(x: W / 2 - 80, y: 150), NSColor.blue.withAlphaComponent(0.8), size: 28)
+    centered(banner, y: 30, size: 24, bg: NSColor.black.withAlphaComponent(0.8))
+    for (i, h) in hints.enumerated() { centered(h, y: 72 + CGFloat(i) * 32, size: 16, bg: NSColor.black.withAlphaComponent(0.7)) }
   }
 }
 
-var wins: [ID: NSWindow] = [:]     // 保留強參照
-var views: [ID: V] = [:]
-/// 校正模式選中的目標：某台螢幕對它的定位螢幕，或一組配對。用身分不用索引，目標增減時不會越界或錯位
-enum Target: Equatable { case kid(ID), pair(ID, ID) }
-var sel: Target = .kid(M.order[1])
-func targets() -> [Target] { M.kids.map(Target.kid) + M.pairs.map { .pair($0.a, $0.b) } }
-func fixSel() { if !targets().contains(sel) { sel = targets()[0] } }
-func pairIndex(_ a: ID, _ b: ID) -> Int? { M.pairs.firstIndex { $0.a == a && $0.b == b } }
-func label(_ t: Target) -> String {
-  switch t {
-  case .kid(let c): return M.names[c]!
-  case .pair(let a, let b): return "\(M.names[a]!)↔\(M.names[b]!)"
-  }
-}
-var expected: [ID: R]?             // 上次送出的預期值，reload 時比對
-var expectedPermanent = false
-var arranging = false              // 空白鍵切換：false = 校正模式、true = 排列模式
-var aSel: ID = 0, bSel: ID?, sideSel: Side?   // 排列：要搬的螢幕、貼靠的螢幕、貼在它的哪一側
+/// borderless 預設不能當 key window，收不到鍵盤
+final class CalibWindow: NSWindow { override var canBecomeKey: Bool { true } }
 
-/// 排列預覽：A 貼到 B 的 side 側後的完整排列；還沒選齊或不可行回 nil
-func preview() -> Plan? {
-  guard arranging, let b = bSel, let side = sideSel else { return nil }
-  return arranged(layout(M.order, M.links, M.rects, M.off), order: M.order, links: M.links, a: aSel, side: side, b: b)
+func activateApp() {
+  if #available(macOS 14, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
 }
 
-func rebuildWindows() {
-  wins.values.forEach { $0.orderOut(nil) }
-  wins = [:]; views = [:]
-  for s in NSScreen.screens {
-    guard let id = screenID(s), M.rects[id] != nil else { continue }
-    let v = V(frame: NSRect(origin: .zero, size: s.frame.size)); v.pm = M.ptmm[id]!
-    let w = NSWindow(contentRect: s.frame, styleMask: .borderless, backing: .buffered, defer: false)
-    w.isReleasedWhenClosed = false
-    w.level = .screenSaver; w.backgroundColor = .clear; w.isOpaque = false; w.ignoresMouseEvents = true
-    w.collectionBehavior = [.canJoinAllSpaces, .stationary]; w.contentView = v; w.orderFrontRegardless()
-    wins[id] = w; views[id] = v
-  }
+func alert(_ msg: String, _ info: String = "") {
+  activateApp()
+  let a = NSAlert(); a.messageText = msg; a.informativeText = info; a.runModal()
 }
 
-func redraw() {
-  var marks: [ID: [Mark]] = [:], items: [MapItem] = [], hints: [String] = []
-  if arranging {
-    let pv = preview()
-    func role(_ id: ID) -> Role {
-      if id == aSel { return pv != nil ? .ghost : .mover }
-      return id == bSel ? .target : .normal
+/// 引導式校正：對每組相鄰螢幕，A 上畫固定線、B 上的線跟著游標，點一下（或 Enter）確認。
+/// 游標位置用 60Hz 輪詢 CGEvent，點擊與按鍵用單一 local monitor（不用 event tap，避免 Input Monitoring 權限）
+final class CalibSession {
+  let m: Model
+  var pairs: [Pair]
+  var idx = 0, done: [Pair] = [], finishing = false, ended = false
+  var wins: [ID: CalibWindow] = [:], views: [ID: V] = [:]
+  var monitor: Any?, timer: Timer?, observers: [NSObjectProtocol] = []
+  var prev: NSRunningApplication?, lastPoll: CGPoint?
+  let onEnd: () -> Void
+
+  init(_ m: Model, onEnd: @escaping () -> Void) { self.m = m; pairs = m.pairs; self.onEnd = onEnd }
+
+  func begin() {
+    calibrating = true
+    prev = NSWorkspace.shared.frontmostApplication
+    for s in NSScreen.screens {
+      guard let id = screenID(s), m.rects[id] != nil else { continue }
+      let w = CalibWindow(contentRect: s.frame, styleMask: .borderless, backing: .buffered, defer: false)
+      w.isReleasedWhenClosed = false
+      w.level = .screenSaver; w.isOpaque = false
+      w.backgroundColor = NSColor.black.withAlphaComponent(0.01)     // alpha 0 的像素會讓點擊穿透
+      w.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+      let v = V(frame: NSRect(origin: .zero, size: s.frame.size))
+      w.contentView = v; w.orderFrontRegardless()
+      wins[id] = w; views[id] = v
     }
-    items = (pv?.rects ?? layout(M.order, M.links, M.rects, M.off)).map { id, r in
-      MapItem(num: M.num[id]!, name: M.names[id]!, r: r, role: role(id))
+    wins.values.first?.makeKey()
+    activateApp()
+    monitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .keyDown]) { [weak self] e in self?.handle(e); return nil }
+    timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60, repeats: true) { [weak self] _ in self?.track() }
+    let nc = NotificationCenter.default                          // 失去焦點或螢幕變動：取消，不存，避免 overlay 困住使用者
+    observers = [NSApplication.didResignActiveNotification, NSApplication.didChangeScreenParametersNotification].map {
+      nc.addObserver(forName: $0, object: nil, queue: .main) { [weak self] _ in self?.end() }
     }
-    let status: String
-    if let b = bSel {
-      if sideSel == nil { status = "→ 現在：按方向鍵，選貼在 \(M.num[b]!) 號的上／下／左／右" }
-      else if pv == nil { status = "× 這個位置不可用（會重疊或造成不連通）" }
-      else { status = "✓ 橘色虛線是搬完後的位置，按 Enter 確認" }
-    } else {
-      status = "→ 現在：按編號，選要貼靠的螢幕（綠）"
-    }
-    hints = ["① Tab 選要搬的螢幕（黃）　② 編號選貼靠的螢幕（綠）　③ 方向鍵選貼哪一側　④ Enter 確認", status]
-  } else {
-    for c in M.kids {
-      let l = M.links[c]!, h = l.side.horizontalLine, on = sel == .kid(c)
-      let mine = l.anchor - M.off[c]!          // 線在 child 區域座標的位置（layout: child 沿邊座標 = parent + off）
-      marks[l.parent, default: []].append(Mark(horizontal: h, pos: CGFloat(l.anchor),
-        text: "對 \(M.names[c]!) 參考線 \(cm(l.anchor, l.parent))", width: on ? 3 : 1.5))
-      marks[c, default: []].append(Mark(horizontal: h, pos: CGFloat(mine),
-        text: "\(M.names[c]!) \(h ? "橫線" : "直線") \(cm(mine, c))\(on ? "  <== 調這台" : "")", width: on ? 3 : 1.5))
-    }
-    for p in M.pairs {                           // 配對：a 上固定線、b 上可動線，都是區域座標，不動螢幕
-      let h = p.side.horizontalLine, on = sel == .pair(p.a, p.b)
-      marks[p.a, default: []].append(Mark(horizontal: h, pos: CGFloat(p.refA),
-        text: "對 \(M.names[p.b]!) 配對參考線 \(cm(p.refA, p.a))", width: on ? 3 : 1.5))
-      marks[p.b, default: []].append(Mark(horizontal: h, pos: CGFloat(p.refB),
-        text: "\(M.names[p.b]!) 配對\(h ? "橫線" : "直線") \(cm(p.refB, p.b))\(on ? "  <== 調這台（Enter 存）" : "")", width: on ? 3 : 1.5))
-    }
-  }
-  for (id, v) in views {
-    v.marks = marks[id] ?? []; v.badge = "\(M.num[id]!)  \(M.names[id]!)"
-    v.map = items; v.hints = hints
-    v.banner = arranging ? "【排列模式】空白鍵／Esc → 回校正模式　q 離開程式" : "【校正模式】空白鍵 → 排列模式　Enter 套用　p 永久　f 換定位"
-    v.bannerBG = arranging ? NSColor.systemBlue : NSColor.black.withAlphaComponent(0.7)
-    v.needsDisplay = true
-  }
-}
-
-// MARK: - 套用
-
-try? FileManager.default.createDirectory(atPath: calibDir, withIntermediateDirectories: true)
-FileManager.default.createFile(atPath: lockPath, contents: nil)          // 校正中：glide 看到就暫停
-atexit { unlink(lockPath) }
-var old = termios(); tcgetattr(0, &old)
-var raw = old; cfmakeraw(&raw); tcsetattr(0, TCSANOW, &raw)
-func quit(_ msg: String = "") -> Never { tcsetattr(0, TCSANOW, &old); print("\r\n\(msg)"); exit(msg.isEmpty ? 0 : 1) }
-func say(_ s: String) { print("\r\u{1b}[K\(s)", terminator: ""); fflush(stdout) }
-
-/// 單一交易送出所有螢幕（含主螢幕）。不在這裡讀回——重排通知是非同步的，由 reload() 統一處理。
-func commit(_ r: [ID: R], permanent: Bool = false) {
-  var cfg: CGDisplayConfigRef?
-  guard CGBeginDisplayConfiguration(&cfg) == .success else { say("無法開始設定"); return }
-  for (id, rect) in r {
-    guard CGConfigureDisplayOrigin(cfg, id, Int32(rect.x), Int32(rect.y)) == .success else {
-      CGCancelDisplayConfiguration(cfg); say("設定 \(M.names[id] ?? "\(id)") 失敗"); return
-    }
-  }
-  guard CGCompleteDisplayConfiguration(cfg, permanent ? .permanently : .forSession) == .success else { say("套用失敗"); return }
-  expected = r; expectedPermanent = permanent
-  scheduleReload(0.5)
-}
-
-var reloadItem: DispatchWorkItem?
-func scheduleReload(_ delay: Double) {
-  reloadItem?.cancel()
-  let item = DispatchWorkItem { reload() }
-  reloadItem = item
-  DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
-}
-
-func reload() {
-  do { M = try load(keeping: (M.order, M.links), keepPairs: M.pairs) } catch let e as Failure { quit(e.msg) } catch { quit("\(error)") }
-  fixSel()
-  if arranging && (M.rects[aSel] == nil || bSel.map({ M.rects[$0] == nil }) == true) {
-    arranging = false; bSel = nil; sideSel = nil      // 排列中拔掉螢幕：選取已失效，退回校正模式
-  }
-  rebuildWindows(); redraw()
-  guard let want = expected else { return }
-  expected = nil
-  let diff = want.filter { M.rects[$0.key] != $0.value }
-  if diff.isEmpty { writeCalib(M.rects, M.order, M.links, M.pairs); say(expectedPermanent ? "已永久套用（重開機後仍保留）" : "已套用（僅本次登入有效，登出後還原；按 p 可永久儲存）"); return }
-  say("系統調整了位置：" + diff.map { id, w in
-    let g = M.rects[id]!
-    return "\(M.names[id]!) 預期(\(w.x),\(w.y)) 實際(\(g.x),\(g.y))"
-  }.joined(separator: " "))
-}
-
-let start = M.rects                // r 還原用：啟動時所有螢幕的位置（含主螢幕）
-
-// MARK: - 鍵盤
-
-enum Key { case up, down, left, right, esc, tab, enter, space, quit, ch(UInt8) }
-
-func parse(_ c: [UInt8]) -> [Key] {
-  var out: [Key] = [], i = 0
-  while i < c.count {
-    if c[i] == 27, i + 2 < c.count, c[i + 1] == 91 {
-      switch c[i + 2] {
-      case 65: out.append(.up)
-      case 66: out.append(.down)
-      case 67: out.append(.right)
-      case 68: out.append(.left)
-      default: break
-      }
-      i += 3; continue
-    }
-    switch c[i] {
-    case 27: out.append(.esc)
-    case 9: out.append(.tab)
-    case 13: out.append(.enter)
-    case 32: out.append(.space)
-    case 3, UInt8(ascii: "q"): out.append(.quit)
-    default: out.append(.ch(c[i]))
-    }
-    i += 1
-  }
-  return out
-}
-
-/// delta > 0：線往上／左移（child 的 off 變大 → 線在 child 區域座標變小）
-func nudge(_ delta: Int) {
-  let id: ID
-  switch sel {
-  case .kid(let c): id = c
-  case .pair(let a, let b):                     // 只改 b 上那條線的區域座標，不動螢幕
-    guard let i = pairIndex(a, b) else { return }
-    let n = M.pairs[i].refB - delta
-    guard (0..<span(M.rects[b]!, M.pairs[i].side)).contains(n) else { say("到底了（線不能離開螢幕）"); return }
-    M.pairs[i].refB = n
     redraw()
-    say("\(M.names[b]!) \(cm(n, b))（Enter 存配對）")
-    return
   }
-  var o = M.off; o[id]! += delta
-  guard valid(layout(M.order, M.links, M.rects, o), M.links) else { say("到底了（線不能離開螢幕或撞到其他螢幕）"); return }
-  M.off = o
-  redraw()
-  say("\(M.names[id]!) \(cm(M.links[id]!.anchor - o[id]!, id))（Enter 套用）")
-}
 
-/// f：把目前這台的定位螢幕（parent）換成下一台與它邊相接的螢幕。位置不動，只改紅線相對誰。
-/// 一律用「含未套用調整」的位置 cur 算，這樣先調再換不會丟掉調整。
-func cycleParent() {
-  guard case .kid(let x) = sel else { say("配對沒有定位螢幕可換"); return }
-  let cur = layout(M.order, M.links, M.rects, M.off), nums = M.num.sorted { $0.value < $1.value }.map { $0.key }
-  let from = nums.firstIndex(of: M.links[x]!.parent)!
-  for k in 1..<nums.count {
-    let u = nums[(from + k) % nums.count]
-    guard u != x, let c = link(cur, parent: u, child: x) else { continue }
-    var l = M.links
-    l[x] = c.link
-    guard let o = topo(M.order[0], l) else { continue }      // 選到自己的子孫會成環，跳過
-    M.order = o; M.links = l; M.off = offsets(cur, l)
-    M.pairs = derivePairs(cur, l, keep: M.pairs); fixSel()   // 原本的配對可能變 tree 邊、tree 邊可能變配對
+  func redraw() {
+    guard idx < pairs.count else { return }
+    let p = pairs[idx], h = p.side.horizontalLine, an = m.names[p.a]!, bn = m.names[p.b]!
+    for (id, v) in views {
+      v.badge = m.names[id]!
+      v.banner = "校正 \(idx + 1)/\(pairs.count)：\(an) ↔ \(bn)"
+      v.hints = ["移動滑鼠，讓 \(bn) 的紅線和 \(an) 的紅線在實體上連成一線，點一下確認",
+                 "方向鍵微調 1 pt　Enter 確認　空白鍵跳過　Esc 取消　（校正中游標修正暫停，有縫的兩台請繞經別台）"]
+      v.marks = []
+    }
+    views[p.a]?.marks = [Mark(horizontal: h, pos: CGFloat(p.refA), text: "\(an) 固定線 \(cm(p.refA, p.a, m))", width: 3)]
+    views[p.b]?.marks = [Mark(horizontal: h, pos: CGFloat(p.refB), text: "\(bn) 跟著游標 \(cm(p.refB, p.b, m))", width: 3)]
+    views.values.forEach { $0.needsDisplay = true }
+  }
+
+  /// 游標在 B 上：線跟著游標沿邊軸座標。只在游標真的動了才更新，不蓋掉方向鍵微調
+  func track() {
+    guard let q = CGEvent(source: nil)?.location else { return }
+    defer { lastPoll = q }
+    guard !finishing, q != lastPoll, idx < pairs.count else { return }
+    let p = pairs[idx], rb = m.rects[p.b]!
+    guard rb.has(q) else { return }
+    setRefB(Int((p.side.horizontalLine ? q.y : q.x).rounded(.down)) - along(rb, p.side))
+  }
+
+  func setRefB(_ v: Int) {
+    let p = pairs[idx]
+    pairs[idx].refB = min(max(v, 0), span(m.rects[p.b]!, p.side) - 1)
     redraw()
-    say("\(M.names[x]!) 改對 \(M.names[u]!) 調整（\(c.link.side.horizontalLine ? "橫線，上下鍵" : "直線，左右鍵")）")
-    return
   }
-  say("沒有其他可當定位的相接螢幕")
-}
 
-func setArranging(_ on: Bool) {
-  arranging = on; bSel = nil; sideSel = nil
-  if on { if case .kid(let c) = sel { aSel = c } else { aSel = M.kids[0] } }
-  redraw()
-  say(on ? "排列模式：照螢幕中央的示意圖操作" : "校正模式")
-}
-
-/// 排列模式的按鍵：Tab 換要搬的螢幕、編號選貼靠的螢幕、方向鍵選哪一側、Enter 確認
-func handleArrange(_ k: Key) {
-  switch k {
-  case .tab:
-    let order = M.num.sorted { $0.value < $1.value }.map { $0.key }
-    aSel = order[(order.firstIndex(of: aSel)! + 1) % order.count]
-    if bSel == aSel { bSel = nil }
-    say("要搬的螢幕：\(M.names[aSel]!)")
-  case .up: sideSel = .above
-  case .down: sideSel = .below
-  case .left: sideSel = .left
-  case .right: sideSel = .right
-  case .ch(let c) where (UInt8(ascii: "1")...UInt8(ascii: "9")).contains(c):
-    guard let id = M.num.first(where: { $0.value == Int(c - UInt8(ascii: "0")) })?.key else { say("沒有這個編號"); return }
-    guard id != aSel else { say("不能貼到自己，請選另一台"); return }
-    bSel = id
-  case .enter:
-    guard let p = preview() else { say("先選貼靠的螢幕與方向，看到橘色虛線再按 Enter"); return }
-    setArranging(false)
-    M.order = p.order; M.links = p.links; M.off = offsets(p.rects, p.links)   // 新拓樸先記下，reload 才會沿用
-    M.pairs = derivePairs(p.rects, p.links, keep: M.pairs); fixSel()
-    commit(p.rects); return
-  case .esc: setArranging(false); return
-  case .quit: quit()
-  default: break
-  }
-  redraw()
-}
-
-func handle(_ k: Key) {
-  if case .space = k { setArranging(!arranging); return }
-  if arranging { handleArrange(k); return }
-  let line: ID, side: Side                      // 要調的線在哪台螢幕、屬於哪個方向
-  switch sel {
-  case .kid(let c): (line, side) = (c, M.links[c]!.side)
-  case .pair(let a, let b): (line, side) = (b, M.pairs[pairIndex(a, b)!].side)
-  }
-  let step = max(1, Int((2 * M.ptmm[line]!).rounded()))
-  let h = side.horizontalLine
-  switch k {
-  case .up where h, .left where !h: nudge(step)
-  case .down where h, .right where !h: nudge(-step)
-  case .up, .down, .left, .right: say(h ? "這台只能調橫線：用上下鍵" : "這台只能調直線：用左右鍵")
-  case .tab: let t = targets(); sel = t[(t.firstIndex(of: sel)! + 1) % t.count]; redraw(); say("調 \(label(sel))")
-  case .enter:
-    if case .pair = sel { writeCalib(M.rects, M.order, M.links, M.pairs); say("已存配對（\(label(sel))）") }   // 螢幕位置沒變，不 commit
-    else { commit(layout(M.order, M.links, M.rects, M.off)) }
-  case .quit: quit()
-  case .esc, .space: break
-  case .ch(let c):
-    switch c {
-    case UInt8(ascii: ","): nudge(1)
-    case UInt8(ascii: "."): nudge(-1)
-    case UInt8(ascii: "f"): cycleParent()
-    case UInt8(ascii: "p"): commit(layout(M.order, M.links, M.rects, M.off), permanent: true)
-    case UInt8(ascii: "r"):
-      if Set(start.keys) == Set(M.rects.keys) { commit(start) } else { say("螢幕組合已改變，無法還原") }
+  func handle(_ e: NSEvent) {
+    guard !finishing else { return }
+    if e.type == .leftMouseDown { confirm(); return }          // 點擊不更新線：位置以最後一次輪詢為準
+    switch e.keyCode {
+    case 36, 76: confirm()
+    case 49: advance()
+    case 53: end()
+    case 126, 123, 125, 124:
+      let h = pairs[idx].side.horizontalLine
+      guard h == (e.keyCode == 126 || e.keyCode == 125) else { return }   // 橫線只收上下，直線只收左右
+      setRefB(pairs[idx].refB + (e.keyCode == 126 || e.keyCode == 123 ? -1 : 1))
     default: break
     }
   }
+
+  func confirm() { done.append(pairs[idx]); advance() }
+
+  func advance() {
+    idx += 1
+    if idx < pairs.count { redraw(); return }
+    if !done.isEmpty {
+      let new = done.map { CalPair(a: m.tags[$0.a]!, b: m.tags[$0.b]!, side: $0.side, refA: $0.refA, refB: $0.refB) }
+      writeCalib(mergeCalib(readCalib(), new))
+    }
+    finishing = true
+    for v in views.values { v.marks = []; v.hints = []; v.banner = done.isEmpty ? "沒有變更" : "校正完成，已儲存"; v.needsDisplay = true }
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in self?.end() }
+  }
+
+  func end() {
+    guard !ended else { return }
+    ended = true
+    if let mo = monitor { NSEvent.removeMonitor(mo) }
+    timer?.invalidate()
+    observers.forEach { NotificationCenter.default.removeObserver($0) }
+    wins.values.forEach { $0.orderOut(nil) }
+    calibrating = false
+    prev?.activate()
+    onEnd()
+  }
 }
 
-rebuildWindows(); redraw()
-NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
-                                       object: nil, queue: .main) { _ in scheduleReload(0.3) }
-print("【校正模式】Tab 換螢幕  f 換定位螢幕  上下／左右=移線(約 2mm)  , . 微調 1pt  Enter 套用(僅本次登入)  p 永久套用  r 還原  q 離開\r")
-print("【排列模式】空白鍵切換：Tab 選要搬的螢幕 → 編號選貼靠的螢幕 → 方向鍵選哪一側 → Enter（螢幕中央有示意圖）\r")
-print("注意：Enter 只在本次登入有效（登出後還原），要保留請按 p。游標只在參考線那一點完全不跳。\r")
+// MARK: - 選單列
 
-FileHandle.standardInput.readabilityHandler = { h in
-  let d = h.availableData; if d.isEmpty { return }
-  let keys = parse([UInt8](d))
-  DispatchQueue.main.async { keys.forEach(handle) }
+final class AppCtl: NSObject {
+  let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+  let statusI = NSMenuItem(), calI = NSMenuItem(), pauseI = NSMenuItem(), loginI = NSMenuItem()
+  var session: CalibSession?
+  var prompted = false
+
+  func start() {
+    if let img = NSImage(systemSymbolName: "display.2", accessibilityDescription: "monitor-align") {
+      img.isTemplate = true; item.button?.image = img
+    } else { item.button?.title = "MA" }
+    let menu = NSMenu(); menu.autoenablesItems = false
+    calI.title = "校正…"
+    for (i, sel) in [(statusI, #selector(openAX)), (calI, #selector(calibrate)), (pauseI, #selector(togglePause)),
+                     (loginI, #selector(toggleLogin))] { i.action = sel; i.target = self; menu.addItem(i) }
+    menu.insertItem(.separator(), at: 1)
+    menu.addItem(.separator())
+    let q = NSMenuItem(title: "結束", action: #selector(quit), keyEquivalent: "q"); q.target = self; menu.addItem(q)
+    item.menu = menu
+    reloadModel()
+    NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { reloadModel(); self?.refresh() }
+    }
+    Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.tick() }
+    tick()
+  }
+
+  /// 每 2 秒：授權後自動建 tap（不用重開）；授權被收回就收掉 tap
+  func tick() {
+    var trusted = AXIsProcessTrusted()
+    if !trusted && !prompted {
+      prompted = true
+      trusted = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary)
+    }
+    if trusted && glideTap == nil { makeTap() }
+    if !trusted, let t = glideTap { CFMachPortInvalidate(t); glideTap = nil }
+    refresh()
+  }
+
+  func refresh() {
+    let trusted = AXIsProcessTrusted()
+    let s: String
+    if !trusted { s = "需要輔助使用權限（點此開啟設定）" }
+    else if let e = loadError { s = "不支援：\(e)" }
+    else if glideTap == nil { s = "游標修正：無法啟動（請移除再重新授權）" }
+    else if calibrating { s = "校正中（游標修正暫停）" }
+    else if glidePaused { s = "游標修正：已暫停" }
+    else { s = "游標修正：啟用" + (M.map { $0.uncal > 0 ? "（\($0.uncal) 組未校正）" : "" } ?? "") }
+    statusI.title = s; statusI.isEnabled = !trusted
+    calI.isEnabled = M != nil && !calibrating
+    pauseI.title = glidePaused ? "啟用游標修正" : "暫停游標修正"
+    switch SMAppService.mainApp.status {
+    case .enabled: loginI.state = .on; loginI.title = "開機自動啟動"
+    case .requiresApproval: loginI.state = .mixed; loginI.title = "開機自動啟動（需到系統設定核准）"
+    default: loginI.state = .off; loginI.title = "開機自動啟動"
+    }
+  }
+
+  @objc func openAX() {
+    NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+  }
+
+  @objc func calibrate() {
+    guard !calibrating, let m = M else { return }
+    session = CalibSession(m) { [weak self] in
+      self?.session = nil
+      DispatchQueue.main.async { reloadModel(); self?.refresh() }
+    }
+    session?.begin()
+    refresh()
+  }
+
+  @objc func togglePause() { glidePaused.toggle(); refresh() }
+
+  @objc func toggleLogin() {
+    let s = SMAppService.mainApp
+    if s.status == .requiresApproval { SMAppService.openSystemSettingsLoginItems(); return }
+    do { if s.status == .enabled { try s.unregister() } else { try s.register() } }
+    catch { alert("開機自動啟動設定失敗", error.localizedDescription) }
+    if s.status == .requiresApproval {
+      alert("需要核准", "請到 系統設定 → 一般 → 登入項目與擴充功能，允許 MonitorAlign。")
+      SMAppService.openSystemSettingsLoginItems()
+    }
+    refresh()
+  }
+
+  @objc func quit() { NSApp.terminate(nil) }
 }
-let app = NSApplication.shared; app.setActivationPolicy(.accessory); app.run()
+
+// MARK: - 進入點
+
+let args = CommandLine.arguments
+if args.contains("--selftest") { selftest() }
+if args.contains("--dump") { dump() }
+
+// 已有同 bundle id 的實例在跑就退出：兩個 tap 會重複 warp
+if let id = Bundle.main.bundleIdentifier,
+   NSRunningApplication.runningApplications(withBundleIdentifier: id).contains(where: { $0.processIdentifier != getpid() }) { exit(0) }
+
+let app = NSApplication.shared
+app.setActivationPolicy(.accessory)
+let ctl = AppCtl()          // NSMenuItem 的 target 是 weak，全域常數保留
+ctl.start()
+app.run()
