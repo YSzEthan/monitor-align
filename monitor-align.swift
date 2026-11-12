@@ -168,6 +168,79 @@ func mergeCalib(_ old: [CalPair], _ new: [CalPair]) -> [CalPair] {
   old.filter { o in !new.contains { Set([$0.a, $0.b]) == Set([o.a, o.b]) } } + new
 }
 
+// MARK: - 版號與更新（純資料；不碰網路、檔案與 AppKit）
+
+let releaseRepo = "YSzEthan/monitor-align"
+
+/// 版號：X.Y.Z（stable）或 X.Y.Z-beta.N。其他 prerelease（-rc 等）一律拒絕
+struct Semver: Comparable {
+  let core: [Int]   // major、minor、patch
+  let beta: Int?    // nil = stable
+  var text: String { core.map(String.init).joined(separator: ".") + (beta.map { "-beta.\($0)" } ?? "") }
+  /// semver 優先序：先比 X.Y.Z；相同時 stable 大於 beta，beta 之間比 N（數字）
+  static func < (a: Semver, b: Semver) -> Bool {
+    if a.core != b.core { return a.core.lexicographicallyPrecedes(b.core) }
+    switch (a.beta, b.beta) {
+    case let (x?, y?): return x < y
+    case (_?, nil): return true
+    default: return false
+    }
+  }
+}
+
+private func digits(_ s: Substring) -> Int? { !s.isEmpty && s.allSatisfy { $0.isASCII && $0.isNumber } ? Int(s) : nil }
+
+/// `v` 前綴可有可無（CFBundleShortVersionString 不帶 v、tag 帶 v）
+func parseSemver(_ s: String) -> Semver? {
+  let t = s.hasPrefix("v") ? s.dropFirst() : Substring(s)
+  let halves = t.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
+  let nums = halves[0].split(separator: ".", omittingEmptySubsequences: false).map(digits)
+  guard nums.count == 3, !nums.contains(where: { $0 == nil }) else { return nil }
+  var beta: Int?
+  if halves.count == 2 {
+    let p = halves[1].split(separator: ".", omittingEmptySubsequences: false)
+    guard p.count == 2, p[0] == "beta", let n = digits(p[1]) else { return nil }
+    beta = n
+  }
+  return Semver(core: nums.compactMap { $0 }, beta: beta)
+}
+
+/// 只收標準寫法的 tag（`v` 開頭、沒有前導 0）：它會被拿去組下載網址，不能有任何額外字元
+func canonicalTag(_ tag: String) -> Semver? {
+  guard let v = parseSemver(tag), "v" + v.text == tag else { return nil }
+  return v
+}
+
+func isNewer(_ latest: String, than current: String) -> Bool {
+  guard let a = parseSemver(latest), let b = parseSemver(current) else { return false }
+  return a > b
+}
+
+func assetName(_ tag: String) -> String? { canonicalTag(tag).map { "MonitorAlign-v\($0.text)-arm64.zip" } }
+
+/// 下載網址由 app 自己用 tag 組，不採用 API 回傳的 browser_download_url
+func downloadURL(_ tag: String, sha: Bool = false) -> URL? {
+  guard let n = assetName(tag) else { return nil }
+  return URL(string: "https://github.com/\(releaseRepo)/releases/download/\(tag)/\(n)\(sha ? ".sha256" : "")")
+}
+
+/// `/releases` 的 JSON 陣列 → 最新的 tag。略過 draft；includeBeta 為 false 時略過 beta；tag 不合標準寫法的整筆略過
+func pickLatest(_ data: Data, includeBeta: Bool) -> String? {
+  struct Rel: Decodable { let tag_name: String; let draft: Bool; let prerelease: Bool }
+  guard let rels = try? JSONDecoder().decode([Rel].self, from: data) else { return nil }
+  return rels.compactMap { r -> Semver? in
+    guard !r.draft, let v = canonicalTag(r.tag_name), includeBeta || (!r.prerelease && v.beta == nil) else { return nil }
+    return v
+  }.max().map { "v" + $0.text }
+}
+
+/// `.sha256` 檔（`<64 位小寫十六進位>  <檔名>`）→ 雜湊；檔名不符或格式不對就是 nil
+func parseSha256(_ text: String, file: String) -> String? {
+  let f = text.split(whereSeparator: \.isWhitespace)
+  guard f.count == 2, f[1] == file, f[0].count == 64, f[0].allSatisfy({ $0.isASCII && ($0.isNumber || ("a"..."f").contains($0)) }) else { return nil }
+  return String(f[0])
+}
+
 func selftest() -> Never {
   var fails = 0
   func check(_ ok: Bool, _ what: String) { if !ok { fails += 1; print("FAIL: \(what)") } }
@@ -244,6 +317,38 @@ func selftest() -> Never {
   check(scale(1440, 2560, CGSize(width: 597, height: 336)) != nil, "scale 旋轉")
   check(scale(1920, 1080, .zero) == nil, "scale mm=0")
   check(scale(1920, 1080, CGSize(width: 300, height: 300)) == nil, "scale 比例不合")
+  // 版號與更新
+  check(parseSemver("v0.1.0-beta.2") == Semver(core: [0, 1, 0], beta: 2) && parseSemver("1.2.3") == Semver(core: [1, 2, 3], beta: nil), "parseSemver：v 前綴可有可無、beta")
+  for bad in ["dev", "", "v", "1.2", "1.2.3.4", "1.2.x", "v1.2.3-rc.1", "v1.2.3-beta", "v1.2.3-beta.", "v1.2.3-beta.x", "v1.2.3-", "v1.2.3-beta.1.2", "-1.2.3", "+1.2.3", "１.2.3", "1.2.3-Beta.1", "1..3"] {
+    check(parseSemver(bad) == nil, "parseSemver 拒絕：\(bad)")
+  }
+  check(isNewer("v0.1.1", than: "0.1.0") && !isNewer("v0.1.0", than: "0.1.0") && !isNewer("v0.1.0", than: "0.1.1"), "isNewer：patch")
+  check(isNewer("v0.10.0", than: "0.9.0") && isNewer("v1.0.0", than: "0.99.99"), "isNewer：數字比較，不是字串")
+  check(isNewer("v0.2.0", than: "0.2.0-beta.9") && !isNewer("v0.2.0-beta.9", than: "0.2.0"), "isNewer：stable 大於同版 beta")
+  check(isNewer("v0.2.0-beta.10", than: "0.2.0-beta.9") && !isNewer("v0.2.0-beta.2", than: "0.2.0-beta.10"), "isNewer：beta N 比數字")
+  check(isNewer("v0.2.0-beta.1", than: "0.1.9") && !isNewer("v0.1.9", than: "0.2.0-beta.1"), "isNewer：下一版的 beta 大於上一版 stable")
+  check(!isNewer("v9.9.9", than: "dev") && !isNewer("garbage", than: "0.1.0"), "isNewer：dev 版或壞版號不提示")
+  check(assetName("v0.1.0-beta.1") == "MonitorAlign-v0.1.0-beta.1-arm64.zip" && assetName("v0.1.0") == "MonitorAlign-v0.1.0-arm64.zip", "assetName")
+  for bad in ["0.1.0", "v01.2.3", "v0.1.0/../x", "v0.1.0?x=1", "v0.1.0 ", "v0.1.0-rc.1"] { check(assetName(bad) == nil && downloadURL(bad) == nil, "tag 不合標準寫法不組網址：\(bad)") }
+  check(downloadURL("v0.1.0-beta.1")?.absoluteString == "https://github.com/YSzEthan/monitor-align/releases/download/v0.1.0-beta.1/MonitorAlign-v0.1.0-beta.1-arm64.zip", "downloadURL")
+  check(downloadURL("v0.1.0", sha: true)?.absoluteString.hasSuffix("/v0.1.0/MonitorAlign-v0.1.0-arm64.zip.sha256") == true, "downloadURL .sha256")
+  let rels = Data(#"""
+    [{"tag_name":"v0.2.0-beta.3","draft":false,"prerelease":true},
+     {"tag_name":"v0.2.0-beta.4","draft":true,"prerelease":true},
+     {"tag_name":"v0.1.5","draft":false,"prerelease":false},
+     {"tag_name":"v0.1.10","draft":false,"prerelease":false},
+     {"tag_name":"v0.3.0-rc.1","draft":false,"prerelease":true},
+     {"tag_name":"nightly","draft":false,"prerelease":false},
+     {"tag_name":"v9.0.0","draft":false,"prerelease":true}]
+    """#.utf8)
+  check(pickLatest(rels, includeBeta: false) == "v0.1.10", "pickLatest：stable 通道略過 beta、draft、壞 tag；0.1.10 > 0.1.5")
+  check(pickLatest(rels, includeBeta: true) == "v9.0.0", "pickLatest：beta 通道取最大（含 prerelease 旗標的 stable 形式 tag）")
+  let rels2 = Data(#"[{"tag_name":"v0.2.0-beta.3","draft":false,"prerelease":true},{"tag_name":"v0.2.0","draft":false,"prerelease":false},{"tag_name":"v0.1.9","draft":false,"prerelease":false}]"#.utf8)
+  check(pickLatest(rels2, includeBeta: true) == "v0.2.0", "pickLatest：stable 發出後，beta 通道選到 stable")
+  check(pickLatest(Data("[]".utf8), includeBeta: true) == nil && pickLatest(Data("壞掉".utf8), includeBeta: false) == nil && pickLatest(Data(#"{"message":"rate limit"}"#.utf8), includeBeta: true) == nil, "pickLatest：空清單、壞 JSON、API 錯誤物件")
+  let h = String(repeating: "ab", count: 32)
+  check(parseSha256("\(h)  MonitorAlign-v0.1.0-arm64.zip\n", file: "MonitorAlign-v0.1.0-arm64.zip") == h, "parseSha256")
+  check(parseSha256("\(h)  other.zip", file: "MonitorAlign-v0.1.0-arm64.zip") == nil && parseSha256("zz  MonitorAlign-v0.1.0-arm64.zip", file: "MonitorAlign-v0.1.0-arm64.zip") == nil && parseSha256(h.uppercased() + "  f", file: "f") == nil && parseSha256("", file: "f") == nil, "parseSha256：檔名不符、格式不對、大寫、空")
   print(fails == 0 ? "selftest 通過" : "selftest 失敗 \(fails) 項")
   exit(fails == 0 ? 0 : 1)
 }
