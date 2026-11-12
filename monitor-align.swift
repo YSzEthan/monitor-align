@@ -14,12 +14,14 @@ struct R: Equatable {
   var x, y, w, h: Int
   var maxX: Int { x + w }
   var maxY: Int { y + h }
+  func has(_ p: CGPoint) -> Bool { p.x >= CGFloat(x) && p.x < CGFloat(maxX) && p.y >= CGFloat(y) && p.y < CGFloat(maxY) }
   func hits(_ o: R) -> Bool { x < o.maxX && o.x < maxX && y < o.maxY && o.y < maxY }
 }
 
 /// child 在 parent 的哪一側
-enum Side {
+enum Side: String, Codable {
   case left, right, above, below
+  var opposite: Side { [.left: .right, .right: .left, .above: .below, .below: .above][self]! }
   /// 左右鄰居調橫線（改 y），上下鄰居調直線（改 x）
   var horizontalLine: Bool { self == .left || self == .right }
 }
@@ -171,6 +173,41 @@ func scale(_ w: Int, _ h: Int, _ mm: CGSize) -> CGFloat? {
   return b.s
 }
 
+/// tree 連結 a↔b（任一方向）。非 tree 鄰居回 nil
+func edgeLink(_ links: [ID: Link], _ a: ID, _ b: ID) -> (link: Link, child: ID)? {
+  if let l = links[b], l.parent == a { return (l, b) }
+  if let l = links[a], l.parent == b { return (l, a) }
+  return nil
+}
+
+/// 游標在 a 的 q 點，要跨到 b：沿邊座標以參考點為共同實體原點，按兩邊 pt/mm 比例換算（參考點在兩邊的全域沿邊座標相同）。
+/// 落點放進 b 內側 2 pt。換算後超出 b 的沿邊範圍超過 slackMM 就回 nil（放行，不擋游標）
+func crossPoint(_ links: [ID: Link], _ r: [ID: R], _ pt: [ID: CGFloat], from a: ID, to b: ID, at q: CGPoint,
+                slackMM: CGFloat = 0) -> CGPoint? {
+  guard let (l, c) = edgeLink(links, a, b) else { return nil }
+  let g = l.side.horizontalLine ? q.y : q.x
+  let ref = CGFloat(along(r[l.parent]!, l.side) + l.anchor)
+  let g2 = ref + (g - ref) * pt[b]! / pt[a]!
+  let rb = r[b]!, lo = CGFloat(along(rb, l.side)), hi = lo + CGFloat(span(rb, l.side)) - 1, slack = slackMM * pt[b]!
+  guard g2 >= lo - slack, g2 <= hi + slack else { return nil }
+  let t = min(max(g2, lo), hi)
+  switch b == c ? l.side.opposite : l.side {      // 進入 b 的哪一側
+  case .left: return CGPoint(x: CGFloat(rb.x + 2), y: t)
+  case .right: return CGPoint(x: CGFloat(rb.maxX - 3), y: t)
+  case .above: return CGPoint(x: t, y: CGFloat(rb.y + 2))
+  case .below: return CGPoint(x: t, y: CGFloat(rb.maxY - 3))
+  }
+}
+
+/// a 在 tree 上的鄰居，以及該鄰居對著 a 的哪一側
+func neighbors(_ links: [ID: Link], _ a: ID) -> [(id: ID, edge: Side)] {
+  links.compactMap { c, l in
+    if l.parent == a { return (c, l.side) }
+    if c == a { return (l.parent, l.side.opposite) }
+    return nil
+  }
+}
+
 func selftest() -> Never {
   var fails = 0
   func check(_ ok: Bool, _ what: String) { if !ok { fails += 1; print("FAIL: \(what)") } }
@@ -220,6 +257,18 @@ func selftest() -> Never {
   check(!valid(layout(du.order, du.links, u, oh), du.links), "HP 左移到參考線出範圍要擋")
   oh = offsets(u, du.links); oh[2]! += 1
   check(!valid(layout(du.order, du.links, u, oh), du.links), "HP 右移撞到 LEN 要擋")
+  let pt: [ID: CGFloat] = [1: 5.06, 3: 3.61, 2: 4.00]
+  let eps: CGFloat = 1e-6
+  let atRef = crossPoint(du.links, u, pt, from: 1, to: 3, at: CGPoint(x: 1056, y: 5))
+  check(atRef == CGPoint(x: 1056, y: -3), "參考點跨界不偏移，落在 LEN 內側 2 pt")
+  let off100 = crossPoint(du.links, u, pt, from: 1, to: 3, at: CGPoint(x: 1156, y: 5))!
+  check(abs(off100.x - (1056 + 100 * 3.61 / 5.06)) < eps, "離參考點 100 pt 依 pt/mm 比例換算")
+  let back = crossPoint(du.links, u, pt, from: 3, to: 1, at: CGPoint(x: off100.x, y: -5))!
+  check(abs(back.x - 1156) < eps && back.y == 2, "來回換算還原，落在 Built-in 內側")
+  check(crossPoint(du.links, u, pt, from: 1, to: 3, at: CGPoint(x: 0, y: 5)) == nil, "換算後出 LEN 範圍要放行")
+  check(crossPoint(du.links, u, pt, from: 1, to: 3, at: CGPoint(x: 0, y: 5), slackMM: 600) != nil, "容許範圍內夾進 LEN")
+  check(crossPoint(du.links, u, pt, from: 2, to: 3, at: CGPoint(x: 641, y: -500)) == nil, "HP↔LEN 非 tree 鄰居不處理")
+  check(Set(neighbors(du.links, 1).map { $0.id }) == [2, 3] && neighbors(du.links, 3).first?.edge == .below, "neighbors")
   check(scale(2560, 1440, CGSize(width: 597, height: 336)) != nil, "scale 正常")
   check(scale(1440, 2560, CGSize(width: 597, height: 336)) != nil, "scale 旋轉")
   check(scale(1920, 1080, .zero) == nil, "scale mm=0")
@@ -240,6 +289,7 @@ struct Model {
   var order: [ID]
   var links: [ID: Link]
   var off: [ID: Int]            // 調整中的沿邊偏移（未套用）
+  var calibrated = false        // links 來自校正檔
   var kids: [ID] { Array(order.dropFirst()) }
 }
 
@@ -253,6 +303,41 @@ func displayIDs(online: Bool) -> [ID] {
 
 func screenID(_ s: NSScreen) -> ID? {
   (s.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
+}
+
+// MARK: - 校正檔（參考點 anchor 校完後無法從 rects 推回，必須存）
+
+let calibDir = NSHomeDirectory() + "/.config/monitor-align"
+let calibPath = calibDir + "/calib.json", lockPath = calibDir + "/calibrating"
+
+/// 同型號螢幕靠 rect 區分；換插孔 DisplayID 會變，所以不用 ID
+func tag(_ id: ID, _ r: R) -> String {
+  "\(CGDisplayVendorNumber(id))-\(CGDisplayModelNumber(id))-\(CGDisplaySerialNumber(id))@\(r.x),\(r.y),\(r.w)x\(r.h)"
+}
+struct CalEntry: Codable { let tag: String; let parent: String?; let side: Side?; let anchor: Int? }
+
+func writeCalib(_ rects: [ID: R], _ order: [ID], _ links: [ID: Link]) {
+  let es = order.map { id in
+    CalEntry(tag: tag(id, rects[id]!), parent: links[id].map { tag($0.parent, rects[$0.parent]!) },
+             side: links[id]?.side, anchor: links[id]?.anchor)
+  }
+  try? FileManager.default.createDirectory(atPath: calibDir, withIntermediateDirectories: true)
+  try? JSONEncoder().encode(es).write(to: URL(fileURLWithPath: calibPath))
+}
+
+/// 檔案與目前所有螢幕（tag 含 rect）完全吻合才採用
+func readCalib(_ rects: [ID: R], root: ID) -> (order: [ID], links: [ID: Link])? {
+  guard let data = FileManager.default.contents(atPath: calibPath),
+        let es = try? JSONDecoder().decode([CalEntry].self, from: data) else { return nil }
+  let ids = Dictionary(rects.map { (tag($0.key, $0.value), $0.key) }, uniquingKeysWith: { a, _ in a })
+  guard es.count == rects.count, Set(es.map { $0.tag }) == Set(ids.keys) else { return nil }
+  var links: [ID: Link] = [:]
+  for e in es {
+    guard let c = ids[e.tag], let p = e.parent.flatMap({ ids[$0] }), let s = e.side,
+          let a = e.anchor else { continue }
+    links[c] = Link(parent: p, side: s, anchor: a)
+  }
+  return topo(root, links).map { ($0, links) }
 }
 
 func load(keeping: (order: [ID], links: [ID: Link])? = nil) throws -> Model {
@@ -275,9 +360,11 @@ func load(keeping: (order: [ID], links: [ID: Link])? = nil) throws -> Model {
     rects[id] = r; ptmm[id] = s
   }
   let root = CGMainDisplayID()
-  var d: (order: [ID], links: [ID: Link])
-  if let k = keeping, stillValid(rects, order: k.order, links: k.links, root: root) {
+  var d: (order: [ID], links: [ID: Link]), cal = false
+  let kept = keeping ?? readCalib(rects, root: root)
+  if let k = kept, stillValid(rects, order: k.order, links: k.links, root: root) {
     d = k                                       // 沿用：parent／anchor 不因重疊長度變動而換
+    cal = keeping == nil
   } else if let n = derive(rects, root: root) {
     d = n
   } else {
@@ -286,7 +373,7 @@ func load(keeping: (order: [ID], links: [ID: Link])? = nil) throws -> Model {
   var num = [root: 1]
   for (i, id) in ids.filter({ $0 != root }).sorted().enumerated() { num[id] = i + 2 }
   return Model(rects: rects, ptmm: ptmm, names: names, num: num, order: d.order, links: d.links,
-               off: offsets(rects, d.links))
+               off: offsets(rects, d.links), calibrated: cal)
 }
 
 func cm(_ pt: Int, _ id: ID) -> String { String(format: "%.1f cm", Double(pt) / Double(M.ptmm[id]!) / 10) }
@@ -303,8 +390,83 @@ if args.contains("--dump") {
     let rel = l.map { "parent=\(M.names[$0.parent]!) side=\($0.side) anchor=\($0.anchor)pt(\(cm($0.anchor, $0.parent)))" } ?? "root"
     print("#\(M.num[id]!) \(M.names[id]!) id=\(id) (\(r.x),\(r.y)) \(r.w)x\(r.h) \(String(format: "%.2f", M.ptmm[id]!))pt/mm \(rel)")
   }
+  print(M.calibrated ? "校正檔：使用 \(calibPath)" : "校正檔：無或與目前排列不符（參考點取重疊中點）")
   exit(0)
 }
+
+// MARK: - 常駐：游標跨螢幕依實體公釐換算
+
+var glideLast: CGPoint?, glidePush: CGFloat = 0, glideSkip = false, glideOn = true
+var glideTap: CFMachPort?
+
+/// 貼著 a 的 e 邊、且朝外的 delta（pt）；不貼邊回 0
+func outward(_ r: R, _ p: CGPoint, _ e: Side, dx: CGFloat, dy: CGFloat) -> CGFloat {
+  switch e {
+  case .left: return p.x <= CGFloat(r.x + 1) ? max(0, -dx) : 0
+  case .right: return p.x >= CGFloat(r.maxX - 2) ? max(0, dx) : 0
+  case .above: return p.y <= CGFloat(r.y + 1) ? max(0, -dy) : 0
+  case .below: return p.y >= CGFloat(r.maxY - 2) ? max(0, dy) : 0
+  }
+}
+
+func glideStep(_ ev: CGEvent) {
+  let p = ev.location, last = glideLast
+  glideLast = p
+  if glideSkip { glideSkip = false; return }                  // warp 後第一個事件的 delta 不可靠
+  guard glideOn, !FileManager.default.fileExists(atPath: lockPath), let q = last,
+        let a = M.rects.first(where: { $0.value.has(q) })?.key else { return }
+  var target: CGPoint?
+  if let b = M.rects.first(where: { $0.value.has(p) })?.key, b != a {
+    target = crossPoint(M.links, M.rects, M.ptmm, from: a, to: b, at: q)       // 系統自己跨過去：換算沿邊位置
+  } else {                                                                      // 卡在邊上往外推：pt 沒接、實體有接
+    let dx = CGFloat(ev.getDoubleValueField(.mouseEventDeltaX)), dy = CGFloat(ev.getDoubleValueField(.mouseEventDeltaY))
+    let hits = neighbors(M.links, a).map { ($0, outward(M.rects[a]!, p, $0.edge, dx: dx, dy: dy)) }.filter { $0.1 > 0 }
+    glidePush = hits.isEmpty ? 0 : glidePush + hits.map { $0.1 }.max()!
+    if glidePush > 8, let n = hits.first?.0 { target = crossPoint(M.links, M.rects, M.ptmm, from: a, to: n.id, at: p, slackMM: 30) }
+  }
+  guard let t = target else { return }
+  glidePush = 0; glideSkip = true; glideLast = t
+  ev.location = t
+  CGWarpMouseCursorPosition(t)
+}
+
+func glideReload() {
+  do { M = try load(); glideOn = true } catch { glideOn = false }
+}
+
+func runGlide() -> Never {
+  guard AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary) else {
+    print("需要輔助使用權限：系統設定 → 隱私權與安全性 → 輔助使用，允許此程式後重新執行（重新編譯後可能要重新授權）")
+    exit(1)
+  }
+  if !M.calibrated { print("警告：沒有校正檔或與目前排列不符，參考點取重疊中點。請先執行 monitor-align 校正並套用") }
+  CGEventSource(stateID: .combinedSessionState)?.localEventsSuppressionInterval = 0
+  let cb: CGEventTapCallBack = { _, type, ev, _ in
+    if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+      if let t = glideTap { CGEvent.tapEnable(tap: t, enable: true) }
+    } else { glideStep(ev) }
+    return Unmanaged.passUnretained(ev)
+  }
+  guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
+                                    eventsOfInterest: 1 << CGEventType.mouseMoved.rawValue, callback: cb, userInfo: nil) else {
+    print("無法建立 event tap（輔助使用權限未生效？）"); exit(1)
+  }
+  glideTap = tap
+  CFRunLoopAddSource(CFRunLoopGetMain(), CFMachPortCreateRunLoopSource(nil, tap, 0), .commonModes)
+  var mtime = (try? FileManager.default.attributesOfItem(atPath: calibPath)[.modificationDate]) as? Date
+  Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in           // 校正檔更新就重讀，停用中也能自己恢復
+    let m = (try? FileManager.default.attributesOfItem(atPath: calibPath)[.modificationDate]) as? Date
+    if m != mtime { mtime = m; glideReload() }
+  }
+  NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil,
+                                         queue: .main) { _ in
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { glideReload() }
+  }
+  print("glide 執行中（\(M.names.count) 台螢幕）。Ctrl-C 離開；校正模式開著時自動暫停")
+  let app = NSApplication.shared; app.setActivationPolicy(.prohibited); app.run()
+  exit(0)
+}
+if args.contains("--glide") { runGlide() }
 
 // MARK: - 畫面
 
@@ -468,6 +630,9 @@ func redraw() {
 
 // MARK: - 套用
 
+try? FileManager.default.createDirectory(atPath: calibDir, withIntermediateDirectories: true)
+FileManager.default.createFile(atPath: lockPath, contents: nil)          // 校正中：glide 看到就暫停
+atexit { unlink(lockPath) }
 var old = termios(); tcgetattr(0, &old)
 var raw = old; cfmakeraw(&raw); tcsetattr(0, TCSANOW, &raw)
 func quit(_ msg: String = "") -> Never { tcsetattr(0, TCSANOW, &old); print("\r\n\(msg)"); exit(msg.isEmpty ? 0 : 1) }
@@ -505,7 +670,7 @@ func reload() {
   guard let want = expected else { return }
   expected = nil
   let diff = want.filter { M.rects[$0.key] != $0.value }
-  if diff.isEmpty { say(expectedPermanent ? "已永久套用（重開機後仍保留）" : "已套用（僅本次登入有效，登出後還原；按 p 可永久儲存）"); return }
+  if diff.isEmpty { writeCalib(M.rects, M.order, M.links); say(expectedPermanent ? "已永久套用（重開機後仍保留）" : "已套用（僅本次登入有效，登出後還原；按 p 可永久儲存）"); return }
   say("系統調整了位置：" + diff.map { id, w in
     let g = M.rects[id]!
     return "\(M.names[id]!) 預期(\(w.x),\(w.y)) 實際(\(g.x),\(g.y))"
