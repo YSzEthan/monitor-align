@@ -47,6 +47,29 @@ monitor-align
 
 位置不可用（會重疊或造成不連通）時，示意圖會提示。排完回校正模式用紅線微調。
 
+### 游標修正常駐（`--glide`）
+
+各螢幕每公釐的 point 數不同時，只靠排列位置只能讓參考線那一點不跳。`--glide` 常駐監聽游標，跨過已校正的交界時，依實體公釐換算沿邊位置再放到對面螢幕。解析度與縮放由你在系統設定自己決定，工具不改。
+
+1. 先執行 `monitor-align` 校正，按 `Enter` 或 `p` 套用；校正結果存在 `~/.config/monitor-align/calib.json`。
+2. 執行 `monitor-align --glide`。第一次要在「系統設定 → 隱私權與安全性 → 輔助使用」允許，授權後重新執行。重新編譯後執行檔簽章會變，可能要重新授權。
+3. 校正模式開著時 glide 自動暫停；改了解析度或排列後，校正檔不吻合，glide 停用，重新校正套用後自動恢復。
+
+開機自動啟動：把下面存成 `~/Library/LaunchAgents/monitor-align.glide.plist`，再 `launchctl load` 它（路徑換成你的家目錄）。
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>monitor-align.glide</string>
+  <key>ProgramArguments</key><array><string>/Users/你/.local/bin/monitor-align</string><string>--glide</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+</dict></plist>
+```
+
+只修正有校正過的交界（每台螢幕對它的定位螢幕）；HP 與 LEN 這種沒校正過的相鄰螢幕照 macOS 原樣。邊框寬度忽略；遊戲、遠端桌面等需要相對滑鼠的程式要先手動停掉 glide。
+
 其他指令：
 
 ```sh
@@ -57,7 +80,7 @@ monitor-align --selftest  # 幾何運算自我測試，不需螢幕
 ## 限制
 
 - `Enter` 與排列用 `.forSession`，只在本次登入有效，登出後還原；按 `p` 才用 `.permanently` 永久寫入。永久寫入後 `r` 只能還原到啟動時的位置，仍需再按 `p` 才會永久還原。
-- 游標只在參考線那一點完全不跳。兩台螢幕每公釐的 point 數不同時，沿邊越遠偏差越大，所以參考線放在重疊區段中點。
+- 單用校正（不開 `--glide`）時，游標只在參考線那一點完全不跳。兩台螢幕每公釐的 point 數不同時，沿邊越遠偏差越大，要順暢請開 `--glide`。
 - 刻度準確度取決於螢幕回報的實體尺寸。尺寸為 0 或與解析度比例對不上時會拒絕執行。
 - 偵測到鏡像會拒絕執行；排列不連通（邊沒有相接）也會拒絕，請先到系統設定修正。
 - 送出後系統可能再調整位置，工具會讀回實際座標，與預期不同時會顯示出來。
