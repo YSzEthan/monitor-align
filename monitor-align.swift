@@ -173,25 +173,64 @@ func scale(_ w: Int, _ h: Int, _ mm: CGSize) -> CGFloat? {
   return b.s
 }
 
-/// tree 連結 a↔b（任一方向）。非 tree 鄰居回 nil
-func edgeLink(_ links: [ID: Link], _ a: ID, _ b: ID) -> (link: Link, child: ID)? {
-  if let l = links[b], l.parent == a { return (l, b) }
-  if let l = links[a], l.parent == b { return (l, a) }
-  return nil
+/// 兩台螢幕之間的一條參考邊（雙向各存一筆）。side = b 相對 a 的側；ref 是各自螢幕的區域座標（離上緣／左緣幾 pt）
+struct Edge { let a, b: ID; let side: Side; let refA, refB: CGFloat }
+
+/// 配對：沒有直接貼合（或不是 tree 邊）的相鄰螢幕，各自存一條參考線。side 固定 .right／.below（a 在左／上）
+struct Pair: Equatable { let a, b: ID; let side: Side; var refA, refB: Int }
+
+/// tree link 與配對一起轉成雙向 Edge。off 由 rects 自己算，不讀互動模式未套用的 M.off
+func makeEdges(_ r: [ID: R], _ links: [ID: Link], _ pairs: [Pair]) -> [Edge] {
+  let off = offsets(r, links)
+  var out: [Edge] = []
+  func add(_ a: ID, _ b: ID, _ s: Side, _ ra: Int, _ rb: Int) {
+    out.append(Edge(a: a, b: b, side: s, refA: CGFloat(ra), refB: CGFloat(rb)))
+    out.append(Edge(a: b, b: a, side: s.opposite, refA: CGFloat(rb), refB: CGFloat(ra)))
+  }
+  for (c, l) in links { add(l.parent, c, l.side, l.anchor, l.anchor - off[c]!) }
+  for p in pairs { add(p.a, p.b, p.side, p.refA, p.refB) }
+  return out
 }
 
-/// 游標在 a 的 q 點，要跨到 b：沿邊座標以參考點為共同實體原點，按兩邊 pt/mm 比例換算（參考點在兩邊的全域沿邊座標相同）。
-/// 落點放進 b 內側 2 pt。換算後超出 b 的沿邊範圍超過 slackMM 就回 nil（放行，不擋游標）
-func crossPoint(_ links: [ID: Link], _ r: [ID: R], _ pt: [ID: CGFloat], from a: ID, to b: ID, at q: CGPoint,
+/// 非 tree 邊的相鄰螢幕：b 完全在 a 的右／下側、沿邊重疊 > 0、空隙小於兩台中較小的寬（高）且沒壓到第三台。
+/// 預設參考線取重疊中點（兩台全域位置相同）；keep 裡 a、b、side 沒變且 ref 仍在範圍內的沿用
+func derivePairs(_ r: [ID: R], _ links: [ID: Link], keep: [Pair]) -> [Pair] {
+  let ids = r.keys.sorted()
+  var out: [Pair] = []
+  for (i, x) in ids.enumerated() {
+    for y in ids[(i + 1)...] {
+      guard links[x]?.parent != y, links[y]?.parent != x else { continue }
+      var (a, b, side) = (x, y, Side.right)
+      if r[a]!.maxX <= r[b]!.x {
+      } else if r[b]!.maxX <= r[a]!.x { swap(&a, &b)
+      } else if r[a]!.maxY <= r[b]!.y { side = .below
+      } else if r[b]!.maxY <= r[a]!.y { swap(&a, &b); side = .below
+      } else { continue }
+      let ra = r[a]!, rb = r[b]!, h = side.horizontalLine
+      let lo = h ? max(ra.y, rb.y) : max(ra.x, rb.x), hi = h ? min(ra.maxY, rb.maxY) : min(ra.maxX, rb.maxX)
+      let gap = h ? R(x: ra.maxX, y: lo, w: rb.x - ra.maxX, h: hi - lo) : R(x: lo, y: ra.maxY, w: hi - lo, h: rb.y - ra.maxY)
+      let gapLen = h ? gap.w : gap.h
+      guard hi > lo, gapLen < (h ? min(ra.w, rb.w) : min(ra.h, rb.h)),
+            gapLen == 0 || !r.contains(where: { $0.key != a && $0.key != b && $0.value.hits(gap) }) else { continue }
+      let mid = (lo + hi) >> 1, d = Pair(a: a, b: b, side: side, refA: mid - along(ra, side), refB: mid - along(rb, side))
+      if let k = keep.first(where: { $0.a == a && $0.b == b && $0.side == side }),
+         (0..<span(ra, side)).contains(k.refA), (0..<span(rb, side)).contains(k.refB) { out.append(k) } else { out.append(d) }
+    }
+  }
+  return out
+}
+
+/// 游標在 a 的 q 點，要跨到 b：全域沿邊座標 → a 區域 → 依兩台 pt/mm 比例以參考點為原點換算 → b 區域 → 全域。
+/// 落點放進 b 面向 a 那側內 2 pt。換算後超出 b 範圍超過 slackMM 就回 nil（放行，不擋游標）
+func crossPoint(_ edges: [Edge], _ r: [ID: R], _ pt: [ID: CGFloat], from a: ID, to b: ID, at q: CGPoint,
                 slackMM: CGFloat = 0) -> CGPoint? {
-  guard let (l, c) = edgeLink(links, a, b) else { return nil }
-  let g = l.side.horizontalLine ? q.y : q.x
-  let ref = CGFloat(along(r[l.parent]!, l.side) + l.anchor)
-  let g2 = ref + (g - ref) * pt[b]! / pt[a]!
-  let rb = r[b]!, lo = CGFloat(along(rb, l.side)), hi = lo + CGFloat(span(rb, l.side)) - 1, slack = slackMM * pt[b]!
-  guard g2 >= lo - slack, g2 <= hi + slack else { return nil }
-  let t = min(max(g2, lo), hi)
-  switch b == c ? l.side.opposite : l.side {      // 進入 b 的哪一側
+  guard let e = edges.first(where: { $0.a == a && $0.b == b }) else { return nil }
+  let rb = r[b]!, n = CGFloat(span(rb, e.side)) - 1, slack = slackMM * pt[b]!
+  let u = (e.side.horizontalLine ? q.y : q.x) - CGFloat(along(r[a]!, e.side))
+  let u2 = e.refB + (u - e.refA) * pt[b]! / pt[a]!
+  guard u2 >= -slack, u2 <= n + slack else { return nil }
+  let t = CGFloat(along(rb, e.side)) + min(max(u2, 0), n)
+  switch e.side.opposite {
   case .left: return CGPoint(x: CGFloat(rb.x + 2), y: t)
   case .right: return CGPoint(x: CGFloat(rb.maxX - 3), y: t)
   case .above: return CGPoint(x: t, y: CGFloat(rb.y + 2))
@@ -199,13 +238,9 @@ func crossPoint(_ links: [ID: Link], _ r: [ID: R], _ pt: [ID: CGFloat], from a: 
   }
 }
 
-/// a 在 tree 上的鄰居，以及該鄰居對著 a 的哪一側
-func neighbors(_ links: [ID: Link], _ a: ID) -> [(id: ID, edge: Side)] {
-  links.compactMap { c, l in
-    if l.parent == a { return (c, l.side) }
-    if c == a { return (l.parent, l.side.opposite) }
-    return nil
-  }
+/// a 的鄰居，以及該鄰居對著 a 的哪一側
+func neighbors(_ edges: [Edge], _ a: ID) -> [(id: ID, edge: Side)] {
+  edges.filter { $0.a == a }.map { ($0.b, $0.side) }
 }
 
 func selftest() -> Never {
@@ -259,16 +294,44 @@ func selftest() -> Never {
   check(!valid(layout(du.order, du.links, u, oh), du.links), "HP 右移撞到 LEN 要擋")
   let pt: [ID: CGFloat] = [1: 5.06, 3: 3.61, 2: 4.00]
   let eps: CGFloat = 1e-6
-  let atRef = crossPoint(du.links, u, pt, from: 1, to: 3, at: CGPoint(x: 1056, y: 5))
+  let eu = makeEdges(u, du.links, [])
+  let atRef = crossPoint(eu, u, pt, from: 1, to: 3, at: CGPoint(x: 1056, y: 5))
   check(atRef == CGPoint(x: 1056, y: -3), "參考點跨界不偏移，落在 LEN 內側 2 pt")
-  let off100 = crossPoint(du.links, u, pt, from: 1, to: 3, at: CGPoint(x: 1156, y: 5))!
+  let off100 = crossPoint(eu, u, pt, from: 1, to: 3, at: CGPoint(x: 1156, y: 5))!
   check(abs(off100.x - (1056 + 100 * 3.61 / 5.06)) < eps, "離參考點 100 pt 依 pt/mm 比例換算")
-  let back = crossPoint(du.links, u, pt, from: 3, to: 1, at: CGPoint(x: off100.x, y: -5))!
+  let back = crossPoint(eu, u, pt, from: 3, to: 1, at: CGPoint(x: off100.x, y: -5))!
   check(abs(back.x - 1156) < eps && back.y == 2, "來回換算還原，落在 Built-in 內側")
-  check(crossPoint(du.links, u, pt, from: 1, to: 3, at: CGPoint(x: 0, y: 5)) == nil, "換算後出 LEN 範圍要放行")
-  check(crossPoint(du.links, u, pt, from: 1, to: 3, at: CGPoint(x: 0, y: 5), slackMM: 600) != nil, "容許範圍內夾進 LEN")
-  check(crossPoint(du.links, u, pt, from: 2, to: 3, at: CGPoint(x: 641, y: -500)) == nil, "HP↔LEN 非 tree 鄰居不處理")
-  check(Set(neighbors(du.links, 1).map { $0.id }) == [2, 3] && neighbors(du.links, 3).first?.edge == .below, "neighbors")
+  check(crossPoint(eu, u, pt, from: 1, to: 3, at: CGPoint(x: 0, y: 5)) == nil, "換算後出 LEN 範圍要放行")
+  check(crossPoint(eu, u, pt, from: 1, to: 3, at: CGPoint(x: 0, y: 5), slackMM: 600) != nil, "容許範圍內夾進 LEN")
+  check(crossPoint(eu, u, pt, from: 2, to: 3, at: CGPoint(x: 641, y: -500)) == nil, "HP↔LEN 非 tree 鄰居不處理")
+  check(Set(neighbors(eu, 1).map { $0.id }) == [2, 3] && neighbors(eu, 3).first?.edge == .below, "neighbors")
+  // 配對：HP(2)、LEN(3) 都掛 Built-in，中間有縫（HP 右緣 642、LEN 左緣 907）
+  let ug: [ID: R] = [1: u[1]!, 2: u[2]!, 3: R(x: 907, y: -1080, w: 1920, h: 1080)]
+  let dg = derive(ug, root: 1)!
+  let pr = derivePairs(ug, dg.links, keep: [])
+  check(pr == [Pair(a: 2, b: 3, side: .right, refA: 540, refB: 540)], "HP↔LEN 配對，預設取重疊中點")
+  var eg = makeEdges(ug, dg.links, pr)
+  check(crossPoint(eg, ug, pt, from: 2, to: 3, at: CGPoint(x: 640, y: -540)) == CGPoint(x: 909, y: -540), "HP→LEN 參考點不偏移")
+  var pk = pr; pk[0].refB = 580
+  eg = makeEdges(ug, dg.links, pk)
+  check(crossPoint(eg, ug, pt, from: 2, to: 3, at: CGPoint(x: 640, y: -540)) == CGPoint(x: 909, y: -500), "refB 調成 580 後同點落 -500")
+  let far = crossPoint(eg, ug, pt, from: 2, to: 3, at: CGPoint(x: 640, y: -440))!
+  check(abs(far.y - (-1080 + 580 + 100 * 3.61 / 4)) < eps, "離參考點 100 pt 依 pt/mm 比例")
+  let back2 = crossPoint(eg, ug, pt, from: 3, to: 2, at: CGPoint(x: 909, y: -500))!
+  check(abs(back2.y - (-540)) < eps && back2.x == 639, "LEN→HP 還原，落在 HP 右緣內側")
+  check(derivePairs(ug, dg.links, keep: pk) == pk, "合法的舊值沿用")
+  var bad = pk; bad[0].refB = 99999
+  check(derivePairs(ug, dg.links, keep: bad) == pr, "範圍外的舊值丟棄，回預設")
+  var ug4 = ug; ug4[4] = R(x: 650, y: -1080, w: 200, h: 1080)
+  check(!derivePairs(ug4, dg.links, keep: []).contains { $0.a == 2 && $0.b == 3 }, "縫中有第三台就不成對")
+  var ugf = ug; ugf[3] = R(x: 2640, y: -1080, w: 1920, h: 1080)
+  check(derivePairs(ugf, dg.links, keep: []).isEmpty, "空隙超過螢幕寬不成對")
+  let ur: [ID: R] = [1: u[1]!, 5: u[2]!, 3: ug[3]!], dr = derive(ur, root: 1)!
+  check(derivePairs(ur, dr.links, keep: []).first.map { $0.a == 5 && $0.b == 3 && $0.side == .right } == true, "id 順序相反仍是 a 在左")
+  let sh = ug.mapValues { R(x: $0.x + 100, y: $0.y + 50, w: $0.w, h: $0.h) }
+  check(crossPoint(makeEdges(sh, dg.links, pk), sh, pt, from: 2, to: 3, at: CGPoint(x: 740, y: -490)) == CGPoint(x: 1009, y: -450), "整體平移：區域 ref 不變，結果跟著平移")
+  let te = makeEdges(ug, dg.links, []).first { $0.a == 1 && $0.b == 3 }!
+  check(te.refA == CGFloat(dg.links[3]!.anchor) && te.refB == CGFloat(dg.links[3]!.anchor - offsets(ug, dg.links)[3]!), "tree 邊 refB = anchor - off")
   check(scale(2560, 1440, CGSize(width: 597, height: 336)) != nil, "scale 正常")
   check(scale(1440, 2560, CGSize(width: 597, height: 336)) != nil, "scale 旋轉")
   check(scale(1920, 1080, .zero) == nil, "scale mm=0")
@@ -290,6 +353,8 @@ struct Model {
   var links: [ID: Link]
   var off: [ID: Int]            // 調整中的沿邊偏移（未套用）
   var calibrated = false        // links 來自校正檔
+  var pairs: [Pair] = []
+  var edges: [Edge] = []        // glide 用：由 rects／links／pairs 建好，不含互動模式未套用的調整
   var kids: [ID] { Array(order.dropFirst()) }
 }
 
@@ -315,32 +380,41 @@ func tag(_ id: ID, _ r: R) -> String {
   "\(CGDisplayVendorNumber(id))-\(CGDisplayModelNumber(id))-\(CGDisplaySerialNumber(id))@\(r.x),\(r.y),\(r.w)x\(r.h)"
 }
 struct CalEntry: Codable { let tag: String; let parent: String?; let side: Side?; let anchor: Int? }
+struct CalPair: Codable { let a: String; let b: String; let side: Side; let refA: Int; let refB: Int }
+struct CalFile: Codable { let entries: [CalEntry]; let pairs: [CalPair] }
 
-func writeCalib(_ rects: [ID: R], _ order: [ID], _ links: [ID: Link]) {
+func writeCalib(_ rects: [ID: R], _ order: [ID], _ links: [ID: Link], _ pairs: [Pair]) {
   let es = order.map { id in
     CalEntry(tag: tag(id, rects[id]!), parent: links[id].map { tag($0.parent, rects[$0.parent]!) },
              side: links[id]?.side, anchor: links[id]?.anchor)
   }
+  let ps = pairs.map { CalPair(a: tag($0.a, rects[$0.a]!), b: tag($0.b, rects[$0.b]!), side: $0.side, refA: $0.refA, refB: $0.refB) }
   try? FileManager.default.createDirectory(atPath: calibDir, withIntermediateDirectories: true)
-  try? JSONEncoder().encode(es).write(to: URL(fileURLWithPath: calibPath))
+  try? JSONEncoder().encode(CalFile(entries: es, pairs: ps)).write(to: URL(fileURLWithPath: calibPath))
 }
 
-/// 檔案與目前所有螢幕（tag 含 rect）完全吻合才採用
-func readCalib(_ rects: [ID: R], root: ID) -> (order: [ID], links: [ID: Link])? {
-  guard let data = FileManager.default.contents(atPath: calibPath),
-        let es = try? JSONDecoder().decode([CalEntry].self, from: data) else { return nil }
+/// 檔案與目前所有螢幕（tag 含 rect）完全吻合才採用。舊格式（純陣列）視為沒有配對；配對的 ref 是否合法交給 derivePairs 判斷
+func readCalib(_ rects: [ID: R], root: ID) -> (order: [ID], links: [ID: Link], pairs: [Pair])? {
+  guard let data = FileManager.default.contents(atPath: calibPath) else { return nil }
+  let dec = JSONDecoder()
+  let file = (try? dec.decode(CalFile.self, from: data))
+    ?? (try? dec.decode([CalEntry].self, from: data)).map { CalFile(entries: $0, pairs: []) }
+  guard let f = file else { return nil }
   let ids = Dictionary(rects.map { (tag($0.key, $0.value), $0.key) }, uniquingKeysWith: { a, _ in a })
-  guard es.count == rects.count, Set(es.map { $0.tag }) == Set(ids.keys) else { return nil }
+  guard f.entries.count == rects.count, Set(f.entries.map { $0.tag }) == Set(ids.keys) else { return nil }
   var links: [ID: Link] = [:]
-  for e in es {
-    guard let c = ids[e.tag], let p = e.parent.flatMap({ ids[$0] }), let s = e.side,
-          let a = e.anchor else { continue }
+  for e in f.entries {
+    guard let c = ids[e.tag], let p = e.parent.flatMap({ ids[$0] }), let s = e.side, let a = e.anchor else { continue }
     links[c] = Link(parent: p, side: s, anchor: a)
   }
-  return topo(root, links).map { ($0, links) }
+  let pairs = f.pairs.compactMap { c -> Pair? in
+    guard let a = ids[c.a], let b = ids[c.b] else { return nil }
+    return Pair(a: a, b: b, side: c.side, refA: c.refA, refB: c.refB)
+  }
+  return topo(root, links).map { ($0, links, pairs) }
 }
 
-func load(keeping: (order: [ID], links: [ID: Link])? = nil) throws -> Model {
+func load(keeping: (order: [ID], links: [ID: Link])? = nil, keepPairs: [Pair]? = nil) throws -> Model {
   if displayIDs(online: true).contains(where: { CGDisplayIsInMirrorSet($0) != 0 }) {
     throw Failure(msg: "偵測到鏡像螢幕，請先到系統設定關閉鏡像")
   }
@@ -361,10 +435,11 @@ func load(keeping: (order: [ID], links: [ID: Link])? = nil) throws -> Model {
   }
   let root = CGMainDisplayID()
   var d: (order: [ID], links: [ID: Link]), cal = false
-  let kept = keeping ?? readCalib(rects, root: root)
+  let file = keeping == nil ? readCalib(rects, root: root) : nil
+  let kept = keeping ?? file.map { ($0.order, $0.links) }
   if let k = kept, stillValid(rects, order: k.order, links: k.links, root: root) {
     d = k                                       // 沿用：parent／anchor 不因重疊長度變動而換
-    cal = keeping == nil
+    cal = file != nil
   } else if let n = derive(rects, root: root) {
     d = n
   } else {
@@ -372,8 +447,9 @@ func load(keeping: (order: [ID], links: [ID: Link])? = nil) throws -> Model {
   }
   var num = [root: 1]
   for (i, id) in ids.filter({ $0 != root }).sorted().enumerated() { num[id] = i + 2 }
+  let pairs = derivePairs(rects, d.links, keep: keepPairs ?? file?.pairs ?? [])
   return Model(rects: rects, ptmm: ptmm, names: names, num: num, order: d.order, links: d.links,
-               off: offsets(rects, d.links), calibrated: cal)
+               off: offsets(rects, d.links), calibrated: cal, pairs: pairs, edges: makeEdges(rects, d.links, pairs))
 }
 
 func cm(_ pt: Int, _ id: ID) -> String { String(format: "%.1f cm", Double(pt) / Double(M.ptmm[id]!) / 10) }
@@ -389,6 +465,9 @@ if args.contains("--dump") {
     let r = M.rects[id]!, l = M.links[id]
     let rel = l.map { "parent=\(M.names[$0.parent]!) side=\($0.side) anchor=\($0.anchor)pt(\(cm($0.anchor, $0.parent)))" } ?? "root"
     print("#\(M.num[id]!) \(M.names[id]!) id=\(id) (\(r.x),\(r.y)) \(r.w)x\(r.h) \(String(format: "%.2f", M.ptmm[id]!))pt/mm \(rel)")
+  }
+  for p in M.pairs {
+    print("配對 \(M.names[p.a]!) ↔ \(M.names[p.b]!) side=\(p.side) refA=\(p.refA)pt(\(cm(p.refA, p.a))) refB=\(p.refB)pt(\(cm(p.refB, p.b)))")
   }
   print(M.calibrated ? "校正檔：使用 \(calibPath)" : "校正檔：無或與目前排列不符（參考點取重疊中點）")
   exit(0)
@@ -417,12 +496,14 @@ func glideStep(_ ev: CGEvent) {
         let a = M.rects.first(where: { $0.value.has(q) })?.key else { return }
   var target: CGPoint?
   if let b = M.rects.first(where: { $0.value.has(p) })?.key, b != a {
-    target = crossPoint(M.links, M.rects, M.ptmm, from: a, to: b, at: q)       // 系統自己跨過去：換算沿邊位置
+    target = crossPoint(M.edges, M.rects, M.ptmm, from: a, to: b, at: q)       // 系統自己跨過去：換算沿邊位置
   } else {                                                                      // 卡在邊上往外推：pt 沒接、實體有接
     let dx = CGFloat(ev.getDoubleValueField(.mouseEventDeltaX)), dy = CGFloat(ev.getDoubleValueField(.mouseEventDeltaY))
-    let hits = neighbors(M.links, a).map { ($0, outward(M.rects[a]!, p, $0.edge, dx: dx, dy: dy)) }.filter { $0.1 > 0 }
+    let hits = neighbors(M.edges, a).map { ($0, outward(M.rects[a]!, p, $0.edge, dx: dx, dy: dy)) }.filter { $0.1 > 0 }
     glidePush = hits.isEmpty ? 0 : glidePush + hits.map { $0.1 }.max()!
-    if glidePush > 8, let n = hits.first?.0 { target = crossPoint(M.links, M.rects, M.ptmm, from: a, to: n.id, at: p, slackMM: 30) }
+    if glidePush > 8 {            // 同側有多個鄰居時依序試，取第一個換算得出來的
+      target = hits.lazy.compactMap { crossPoint(M.edges, M.rects, M.ptmm, from: a, to: $0.0.id, at: p, slackMM: 30) }.first
+    }
   }
   guard let t = target else { return }
   glidePush = 0; glideSkip = true; glideLast = t
@@ -563,7 +644,18 @@ final class V: NSView {
 
 var wins: [ID: NSWindow] = [:]     // 保留強參照
 var views: [ID: V] = [:]
-var active = 0                     // M.kids 的索引
+/// 校正模式選中的目標：某台螢幕對它的定位螢幕，或一組配對。用身分不用索引，目標增減時不會越界或錯位
+enum Target: Equatable { case kid(ID), pair(ID, ID) }
+var sel: Target = .kid(M.order[1])
+func targets() -> [Target] { M.kids.map(Target.kid) + M.pairs.map { .pair($0.a, $0.b) } }
+func fixSel() { if !targets().contains(sel) { sel = targets()[0] } }
+func pairIndex(_ a: ID, _ b: ID) -> Int? { M.pairs.firstIndex { $0.a == a && $0.b == b } }
+func label(_ t: Target) -> String {
+  switch t {
+  case .kid(let c): return M.names[c]!
+  case .pair(let a, let b): return "\(M.names[a]!)↔\(M.names[b]!)"
+  }
+}
 var expected: [ID: R]?             // 上次送出的預期值，reload 時比對
 var expectedPermanent = false
 var arranging = false              // 空白鍵切換：false = 校正模式、true = 排列模式
@@ -610,13 +702,20 @@ func redraw() {
     }
     hints = ["① Tab 選要搬的螢幕（黃）　② 編號選貼靠的螢幕（綠）　③ 方向鍵選貼哪一側　④ Enter 確認", status]
   } else {
-    for (i, c) in M.kids.enumerated() {
-      let l = M.links[c]!, h = l.side.horizontalLine, on = i == active
+    for c in M.kids {
+      let l = M.links[c]!, h = l.side.horizontalLine, on = sel == .kid(c)
       let mine = l.anchor - M.off[c]!          // 線在 child 區域座標的位置（layout: child 沿邊座標 = parent + off）
       marks[l.parent, default: []].append(Mark(horizontal: h, pos: CGFloat(l.anchor),
         text: "對 \(M.names[c]!) 參考線 \(cm(l.anchor, l.parent))", width: on ? 3 : 1.5))
       marks[c, default: []].append(Mark(horizontal: h, pos: CGFloat(mine),
         text: "\(M.names[c]!) \(h ? "橫線" : "直線") \(cm(mine, c))\(on ? "  <== 調這台" : "")", width: on ? 3 : 1.5))
+    }
+    for p in M.pairs {                           // 配對：a 上固定線、b 上可動線，都是區域座標，不動螢幕
+      let h = p.side.horizontalLine, on = sel == .pair(p.a, p.b)
+      marks[p.a, default: []].append(Mark(horizontal: h, pos: CGFloat(p.refA),
+        text: "對 \(M.names[p.b]!) 配對參考線 \(cm(p.refA, p.a))", width: on ? 3 : 1.5))
+      marks[p.b, default: []].append(Mark(horizontal: h, pos: CGFloat(p.refB),
+        text: "\(M.names[p.b]!) 配對\(h ? "橫線" : "直線") \(cm(p.refB, p.b))\(on ? "  <== 調這台（Enter 存）" : "")", width: on ? 3 : 1.5))
     }
   }
   for (id, v) in views {
@@ -661,8 +760,8 @@ func scheduleReload(_ delay: Double) {
 }
 
 func reload() {
-  do { M = try load(keeping: (M.order, M.links)) } catch let e as Failure { quit(e.msg) } catch { quit("\(error)") }
-  active = min(active, M.kids.count - 1)
+  do { M = try load(keeping: (M.order, M.links), keepPairs: M.pairs) } catch let e as Failure { quit(e.msg) } catch { quit("\(error)") }
+  fixSel()
   if arranging && (M.rects[aSel] == nil || bSel.map({ M.rects[$0] == nil }) == true) {
     arranging = false; bSel = nil; sideSel = nil      // 排列中拔掉螢幕：選取已失效，退回校正模式
   }
@@ -670,7 +769,7 @@ func reload() {
   guard let want = expected else { return }
   expected = nil
   let diff = want.filter { M.rects[$0.key] != $0.value }
-  if diff.isEmpty { writeCalib(M.rects, M.order, M.links); say(expectedPermanent ? "已永久套用（重開機後仍保留）" : "已套用（僅本次登入有效，登出後還原；按 p 可永久儲存）"); return }
+  if diff.isEmpty { writeCalib(M.rects, M.order, M.links, M.pairs); say(expectedPermanent ? "已永久套用（重開機後仍保留）" : "已套用（僅本次登入有效，登出後還原；按 p 可永久儲存）"); return }
   say("系統調整了位置：" + diff.map { id, w in
     let g = M.rects[id]!
     return "\(M.names[id]!) 預期(\(w.x),\(w.y)) 實際(\(g.x),\(g.y))"
@@ -711,7 +810,18 @@ func parse(_ c: [UInt8]) -> [Key] {
 
 /// delta > 0：線往上／左移（child 的 off 變大 → 線在 child 區域座標變小）
 func nudge(_ delta: Int) {
-  let id = M.kids[active]
+  let id: ID
+  switch sel {
+  case .kid(let c): id = c
+  case .pair(let a, let b):                     // 只改 b 上那條線的區域座標，不動螢幕
+    guard let i = pairIndex(a, b) else { return }
+    let n = M.pairs[i].refB - delta
+    guard (0..<span(M.rects[b]!, M.pairs[i].side)).contains(n) else { say("到底了（線不能離開螢幕）"); return }
+    M.pairs[i].refB = n
+    redraw()
+    say("\(M.names[b]!) \(cm(n, b))（Enter 存配對）")
+    return
+  }
   var o = M.off; o[id]! += delta
   guard valid(layout(M.order, M.links, M.rects, o), M.links) else { say("到底了（線不能離開螢幕或撞到其他螢幕）"); return }
   M.off = o
@@ -722,7 +832,8 @@ func nudge(_ delta: Int) {
 /// f：把目前這台的定位螢幕（parent）換成下一台與它邊相接的螢幕。位置不動，只改紅線相對誰。
 /// 一律用「含未套用調整」的位置 cur 算，這樣先調再換不會丟掉調整。
 func cycleParent() {
-  let x = M.kids[active], cur = layout(M.order, M.links, M.rects, M.off), nums = M.num.sorted { $0.value < $1.value }.map { $0.key }
+  guard case .kid(let x) = sel else { say("配對沒有定位螢幕可換"); return }
+  let cur = layout(M.order, M.links, M.rects, M.off), nums = M.num.sorted { $0.value < $1.value }.map { $0.key }
   let from = nums.firstIndex(of: M.links[x]!.parent)!
   for k in 1..<nums.count {
     let u = nums[(from + k) % nums.count]
@@ -731,6 +842,7 @@ func cycleParent() {
     l[x] = c.link
     guard let o = topo(M.order[0], l) else { continue }      // 選到自己的子孫會成環，跳過
     M.order = o; M.links = l; M.off = offsets(cur, l)
+    M.pairs = derivePairs(cur, l, keep: M.pairs); fixSel()   // 原本的配對可能變 tree 邊、tree 邊可能變配對
     redraw()
     say("\(M.names[x]!) 改對 \(M.names[u]!) 調整（\(c.link.side.horizontalLine ? "橫線，上下鍵" : "直線，左右鍵")）")
     return
@@ -740,7 +852,7 @@ func cycleParent() {
 
 func setArranging(_ on: Bool) {
   arranging = on; bSel = nil; sideSel = nil
-  if on { aSel = M.kids[active] }
+  if on { if case .kid(let c) = sel { aSel = c } else { aSel = M.kids[0] } }
   redraw()
   say(on ? "排列模式：照螢幕中央的示意圖操作" : "校正模式")
 }
@@ -765,6 +877,7 @@ func handleArrange(_ k: Key) {
     guard let p = preview() else { say("先選貼靠的螢幕與方向，看到橘色虛線再按 Enter"); return }
     setArranging(false)
     M.order = p.order; M.links = p.links; M.off = offsets(p.rects, p.links)   // 新拓樸先記下，reload 才會沿用
+    M.pairs = derivePairs(p.rects, p.links, keep: M.pairs); fixSel()
     commit(p.rects); return
   case .esc: setArranging(false); return
   case .quit: quit()
@@ -776,15 +889,21 @@ func handleArrange(_ k: Key) {
 func handle(_ k: Key) {
   if case .space = k { setArranging(!arranging); return }
   if arranging { handleArrange(k); return }
-  let kid = M.kids[active]
-  let step = max(1, Int((2 * M.ptmm[kid]!).rounded()))
-  let h = M.links[kid]!.side.horizontalLine
+  let line: ID, side: Side                      // 要調的線在哪台螢幕、屬於哪個方向
+  switch sel {
+  case .kid(let c): (line, side) = (c, M.links[c]!.side)
+  case .pair(let a, let b): (line, side) = (b, M.pairs[pairIndex(a, b)!].side)
+  }
+  let step = max(1, Int((2 * M.ptmm[line]!).rounded()))
+  let h = side.horizontalLine
   switch k {
   case .up where h, .left where !h: nudge(step)
   case .down where h, .right where !h: nudge(-step)
   case .up, .down, .left, .right: say(h ? "這台只能調橫線：用上下鍵" : "這台只能調直線：用左右鍵")
-  case .tab: active = (active + 1) % M.kids.count; redraw(); say("調 \(M.names[M.kids[active]]!)")
-  case .enter: commit(layout(M.order, M.links, M.rects, M.off))
+  case .tab: let t = targets(); sel = t[(t.firstIndex(of: sel)! + 1) % t.count]; redraw(); say("調 \(label(sel))")
+  case .enter:
+    if case .pair = sel { writeCalib(M.rects, M.order, M.links, M.pairs); say("已存配對（\(label(sel))）") }   // 螢幕位置沒變，不 commit
+    else { commit(layout(M.order, M.links, M.rects, M.off)) }
   case .quit: quit()
   case .esc, .space: break
   case .ch(let c):
