@@ -2,3 +2,4 @@
 *.o
 monitor-align
 !monitor-align.swift
+build/

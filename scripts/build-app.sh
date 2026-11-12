@@ -1,0 +1,12 @@
+#!/bin/sh
+# 編譯並組出 build/MonitorAlign.app（ad-hoc 簽章）。install.sh 與 CI 共用。
+# 版號由環境變數 VERSION 帶入，沒帶就是 dev。
+set -eu
+cd "$(dirname "$0")/.."
+OUT=${OUT:-build}/MonitorAlign.app
+rm -rf "$OUT"
+mkdir -p "$OUT/Contents/MacOS"
+swiftc -O monitor-align.swift -o "$OUT/Contents/MacOS/monitor-align"
+sed "s/__VERSION__/${VERSION:-dev}/g" Info.plist > "$OUT/Contents/Info.plist"
+codesign --force -s - --identifier dev.monitor-align "$OUT"
+echo "$OUT"
