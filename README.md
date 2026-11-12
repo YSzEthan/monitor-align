@@ -19,7 +19,9 @@ macOS 多螢幕游標修正。各螢幕每公釐的 point 數不同（解析度�
 
 ### 發版與下載
 
-`main` 每次合併 PR 都會自動發版（版號 patch +1，PR 標籤 `minor`／`major` 升對應位數，`no-release` 不發版），Release 附 `MonitorAlign-vX.Y.Z-arm64.zip` 與 `.sha256`，只支援 Apple Silicon。
+合進 `dev` 自動發 **beta**（`vX.Y.Z-beta.N`，標為 prerelease）；`dev` 合進 `main` 自動發 **stable**（`vX.Y.Z`）。Release 附 `MonitorAlign-vX.Y.Z[-beta.N]-arm64.zip` 與 `.sha256`，只支援 Apple Silicon。PR 標籤 `minor`／`major` 升對應位數，`no-release` 不發版。
+
+要接收測試版：選單裡勾「接收測試版（beta）」，預設關。關掉時，目前裝的若是 beta 不會被降級，只會在有比它新的 stable 時提示更新。
 
 Release 裡的 app 是 ad-hoc 簽章、沒有公證，所以：
 
