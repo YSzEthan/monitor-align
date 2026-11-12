@@ -17,6 +17,17 @@ macOS 多螢幕游標修正。各螢幕每公釐的 point 數不同（解析度�
 
 之後重新編譯授權不會掉，因為每次都用同一張憑證簽章。
 
+### 發版與下載
+
+`main` 每次合併 PR 都會自動發版（版號 patch +1，PR 標籤 `minor`／`major` 升對應位數，`no-release` 不發版），Release 附 `MonitorAlign-vX.Y.Z-arm64.zip` 與 `.sha256`，只支援 Apple Silicon。
+
+Release 裡的 app 是 ad-hoc 簽章、沒有公證，所以：
+
+- 下載後第一次開啟會被 Gatekeeper 擋，需要到「系統設定 → 隱私權與安全性」按「仍要打開」。
+- 輔助使用授權綁簽章身分，ad-hoc 簽章每次更新都會失效。
+
+信任模型：SHA256 與 zip 放在同一個 Release，只防傳輸損毀、不防竄改；信任的對象就是這個 repo 的寫入權。要自己掌控簽章與程式來源，請用 `./install.sh` 自己編譯。
+
 ## 使用
 
 選單列右上角的雙螢幕圖示：

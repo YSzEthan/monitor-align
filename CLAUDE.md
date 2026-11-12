@@ -24,6 +24,24 @@ build/MonitorAlign.app/Contents/MacOS/monitor-align --dump       # 印螢幕、p
 - 同名憑證可能有多張，`codesign -s` 一律傳 SHA-1 hash。
 - 不要用 event tap 抓鍵盤（會多一個 Input Monitoring 權限）；校正用 local `NSEvent` monitor 與 60Hz 輪詢游標位置。
 
+## 發版（專案例外）
+
+**此專案 merge 到 `main` 就自動發版，版號自動 patch +1。全域規範的「版號 commit 經 PR、推 tag 前先問」在這裡不適用，以本段為準**，不要因為全域規範而停下來問要不要打 tag。
+
+- `.github/workflows/release.yml`：`push` 到 `main`（squash merge）或 `workflow_dispatch`（只准從 `main` 觸發）。組 `MonitorAlign-vX.Y.Z-arm64.zip` 與 `.sha256`，**最後才** `gh release create`，所以中途失敗不會留下孤兒 tag。
+- PR 標籤：`minor`／`major` 升對應位數；`no-release` 不發版。沒有任何 `v*` tag 時從 `v0.1.0` 起。
+- 標籤靠 `commits/{sha}/pulls` 查，不解析 commit 標題（squash 後常有多個編號）。連續三個 merge 時，排隊中被取消的那次內容併入下一版，它 PR 上的 `minor`／`major` 標籤會丟失。
+- `VERSION` 不帶 `v`（`0.1.1`）；tag 帶 `v`。本機編譯的版號是 `dev`。
+- `main` 要開分支保護（要求 PR）。沒有保護時 owner 直接 push 到 `main` 也會發版。
+
+### 信任根
+
+- zip 與 SHA256 放在同一個 Release，HTTPS 已保證傳輸完整，所以 SHA256 只防傳輸損毀、**不防竄改**。
+- 真正的信任根是「任何能寫入這個 repo 或 Release 的人或東西」，包括被入侵的 action 依賴。
+- 最大風險是 app 內「檢查更新…」用使用者本機憑證重簽下載的 app：能把檔案放進 Release 的人，就能讓它繼承輔助使用權限（event tap 足以側錄鍵盤）。要做真正的來源驗證得用離線金鑰簽 Release，那跟 CI 自動發版互相矛盾，所以不做。
+- 緩解：`main` 分支保護、action 以 commit SHA 釘版本、下載網址由 app 自己用 tag 組（不信 API 回傳的網址）、解壓後驗 bundle id 與版本、更新一律由使用者確認。
+- 不共用憑證：私鑰不放 GitHub，每個使用者在自己機器建自己的憑證。
+
 ## 流程
 
 遵守全域開發規範（issue → branch `issue/<n>` → plan → review → 實作 → `/simplify` → CI 綠燈 → commit → PR）。PR 的 CI（`.github/workflows/ci.yml`）在 arm64 macOS 跑編譯與 selftest。
