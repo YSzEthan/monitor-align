@@ -45,24 +45,53 @@ func contact(_ a: R, _ b: R) -> (Side, Int, Int)? {
   return nil
 }
 
-/// 從 root 長出最大重疊生成樹（Prim）：每次挑「已加入 × 未加入」中重疊最長的一對。不連通回 nil。
+/// v 貼著 u 時的 link（參考線取重疊中點）與重疊長度；不相接回 nil
+func link(_ r: [ID: R], parent u: ID, child v: ID) -> (len: Int, link: Link)? {
+  guard let (s, lo, hi) = contact(r[u]!, r[v]!) else { return nil }
+  return (hi - lo, Link(parent: u, side: s, anchor: ((lo + hi) >> 1) - along(r[u]!, s)))
+}
+
+/// 每條 link 的 child 仍貼在 parent 的同一側
+func sidesHold(_ r: [ID: R], _ links: [ID: Link]) -> Bool {
+  links.allSatisfy { contact(r[$0.value.parent]!, r[$0.key]!)?.0 == $0.value.side }
+}
+
+/// 從 root 一層一層長樹：每輪只讓「上一輪以前已加入」的螢幕當 parent，所以直接貼 root 的都以 root 為 parent；
+/// 同一輪內挑沿邊重疊最長者。不連通回 nil。
 func derive(_ r: [ID: R], root: ID) -> (order: [ID], links: [ID: Link])? {
   guard r[root] != nil else { return nil }
   var order = [root], links: [ID: Link] = [:]
   let ids = r.keys.sorted()
   while order.count < r.count {
-    var best: (len: Int, id: ID, link: Link)?
-    for u in order {
-      for v in ids where !order.contains(v) {
-        guard let (side, lo, hi) = contact(r[u]!, r[v]!), hi - lo > (best?.len ?? 0) else { continue }
-        best = (hi - lo, v, Link(parent: u, side: side, anchor: ((lo + hi) >> 1) - along(r[u]!, side)))
+    let joined = order
+    for v in ids where !joined.contains(v) {
+      var best: (len: Int, link: Link)?
+      for u in joined {
+        guard let c = link(r, parent: u, child: v), c.len > (best?.len ?? 0) else { continue }
+        best = c
       }
+      if let b = best { links[v] = b.link; order.append(v) }
     }
-    guard let b = best else { return nil }
-    links[b.id] = b.link
-    order.append(b.id)
+    if order.count == joined.count { return nil }
   }
   return (order, links)
+}
+
+/// links 是否仍描述 rects：同一批螢幕、root 沒換、每條貼合側沒變、無重疊且參考線在範圍內
+func stillValid(_ r: [ID: R], order: [ID], links: [ID: Link], root: ID) -> Bool {
+  order.first == root && Set(order) == Set(r.keys) && links.count == order.count - 1
+    && sidesHold(r, links) && valid(r, links)
+}
+
+/// 由 links 拓樸排序（parent 一定在前）；有環回 nil
+func topo(_ root: ID, _ links: [ID: Link]) -> [ID]? {
+  var o = [root], rest = links
+  while !rest.isEmpty {
+    let ready = rest.filter { o.contains($0.value.parent) }.keys.sorted()
+    if ready.isEmpty { return nil }
+    o += ready; ready.forEach { rest[$0] = nil }
+  }
+  return o
 }
 
 /// child 與 parent 的沿邊偏移（調整期間唯一會變的量）
@@ -108,14 +137,25 @@ func place(_ a: R, beside b: R, _ s: Side) -> R {
   return a
 }
 
-/// 排列：a 貼到 b 的 side 側。回傳新的完整 rects（主螢幕 (0,0)）；重疊或不連通回 nil
-func arranged(_ cur: [ID: R], a: ID, side: Side, b: ID, root: ID) -> [ID: R]? {
+struct Plan { var rects: [ID: R]; var order: [ID]; var links: [ID: Link] }
+
+/// 排列：a 貼到 b 的 side 側。只改 a 的 link（直接寫死，不重推），其餘沿用；
+/// 沿用的 link 失效（貼合側變了、有環、參考線出範圍）才整棵重推。重疊或不連通回 nil
+func arranged(_ cur: [ID: R], order: [ID], links: [ID: Link], a: ID, side: Side, b: ID) -> Plan? {
   guard a != b, let ra = cur[a], let rb = cur[b] else { return nil }
   var n = cur
   n[a] = place(ra, beside: rb, side)
-  guard !n.contains(where: { $0.key != a && $0.value.hits(n[a]!) }),
-        let d = derive(n, root: root) else { return nil }
-  return layout(d.order, d.links, n, offsets(n, d.links))
+  guard !n.contains(where: { $0.key != a && $0.value.hits(n[a]!) }) else { return nil }
+  func plan(_ o: [ID], _ l: [ID: Link]) -> Plan? {
+    let rects = layout(o, l, n, offsets(n, l))
+    return valid(rects, l) ? Plan(rects: rects, order: o, links: l) : nil
+  }
+  var l = links
+  if a != order[0], let c = link(n, parent: b, child: a) { l[a] = c.link }
+  if sidesHold(n, l),
+     let o = topo(order[0], l), let p = plan(o, l) { return p }
+  guard let d = derive(n, root: order[0]) else { return nil }
+  return plan(d.order, d.links)
 }
 
 /// pt/mm。mm 為 0、寬高比對不上（旋轉會自動換邊比對）或不合理就回 nil
@@ -154,15 +194,32 @@ func selftest() -> Never {
   check(derive([1: R(x: 0, y: 0, w: 10, h: 10), 2: R(x: 50, y: 0, w: 10, h: 10)], root: 1) == nil, "有縫不連通")
   check(!valid([1: R(x: 0, y: 0, w: 10, h: 10), 2: R(x: 5, y: 5, w: 10, h: 10)], [:]), "重疊無效")
   // 排列：FHD 貼到 ASUS 下方 → parent 變 ASUS
-  let a = arranged(r, a: 3, side: .below, b: 2, root: 1)!
-  let d2 = derive(a, root: 1)!
-  check(d2.links[3]?.parent == 2 && d2.links[3]?.side == .below, "排列後 FHD 掛 ASUS 下")
-  check(arranged(r, a: 2, side: .above, b: 3, root: 1) == nil, "ASUS 搬到 FHD 上方會與 BenQ 重疊或斷線")
+  let a = arranged(r, order: d.order, links: d.links, a: 3, side: .below, b: 2)!
+  check(a.links[3]?.parent == 2 && a.links[3]?.side == .below, "排列後 FHD 掛 ASUS 下（寫死，不被 BFS 改回 BenQ）")
+  check(stillValid(a.rects, order: a.order, links: a.links, root: 1), "排列結果 stillValid")
+  check(arranged(r, order: d.order, links: d.links, a: 2, side: .above, b: 3) == nil, "ASUS 搬到 FHD 上方會與 BenQ 重疊或斷線")
   // 主螢幕被搬走時整體平移回 (0,0)
-  check(arranged(r, a: 1, side: .right, b: 2, root: 1) == nil, "搬主螢幕壓到 FHD 要拒絕")
-  let two: [ID: R] = [1: r[1]!, 2: r[2]!]
-  let m = arranged(two, a: 1, side: .right, b: 2, root: 1)!
+  check(arranged(r, order: d.order, links: d.links, a: 1, side: .right, b: 2) == nil, "搬主螢幕壓到 FHD 要拒絕")
+  let two: [ID: R] = [1: r[1]!, 2: r[2]!], d3 = derive(two, root: 1)!
+  let m = arranged(two, order: d3.order, links: d3.links, a: 1, side: .right, b: 2)!.rects
   check(m[1] == R(x: 0, y: 0, w: 2560, h: 1440) && m[2] == R(x: -1920, y: 0, w: 1920, h: 1080), "主螢幕回 (0,0) 並整體平移")
+  // 內建在下、HP 與 LEN 並排在上：兩台都直接掛內建，且調整時 parent／anchor 不變
+  let u: [ID: R] = [1: R(x: 0, y: 0, w: 1470, h: 956), 3: R(x: 642, y: -1080, w: 1920, h: 1080),
+                    2: R(x: -1278, y: -1080, w: 1920, h: 1080)]
+  let du = derive(u, root: 1)!
+  check(du.links[2]?.parent == 1 && du.links[3]?.parent == 1 && du.links[2]?.side == .above, "HP、LEN 都掛 Built-in")
+  var ou = offsets(u, du.links)
+  ou[3]! += 400
+  let lu = layout(du.order, du.links, u, ou)
+  check(valid(lu, du.links) && stillValid(lu, order: du.order, links: du.links, root: 1), "LEN 右移後 links 仍成立")
+  var cl = du.links; cl[2] = Link(parent: 3, side: .left, anchor: 540)
+  check(topo(1, cl) == [1, 3, 2], "HP 改掛 LEN 後 topo 排序")
+  cl[3] = Link(parent: 2, side: .right, anchor: 540)
+  check(topo(1, cl) == nil, "互為 parent 成環要擋")
+  var oh = offsets(u, du.links); oh[2]! -= 1300
+  check(!valid(layout(du.order, du.links, u, oh), du.links), "HP 左移到參考線出範圍要擋")
+  oh = offsets(u, du.links); oh[2]! += 1
+  check(!valid(layout(du.order, du.links, u, oh), du.links), "HP 右移撞到 LEN 要擋")
   check(scale(2560, 1440, CGSize(width: 597, height: 336)) != nil, "scale 正常")
   check(scale(1440, 2560, CGSize(width: 597, height: 336)) != nil, "scale 旋轉")
   check(scale(1920, 1080, .zero) == nil, "scale mm=0")
@@ -198,7 +255,7 @@ func screenID(_ s: NSScreen) -> ID? {
   (s.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
 }
 
-func load() throws -> Model {
+func load(keeping: (order: [ID], links: [ID: Link])? = nil) throws -> Model {
   if displayIDs(online: true).contains(where: { CGDisplayIsInMirrorSet($0) != 0 }) {
     throw Failure(msg: "偵測到鏡像螢幕，請先到系統設定關閉鏡像")
   }
@@ -218,7 +275,12 @@ func load() throws -> Model {
     rects[id] = r; ptmm[id] = s
   }
   let root = CGMainDisplayID()
-  guard let d = derive(rects, root: root) else {
+  var d: (order: [ID], links: [ID: Link])
+  if let k = keeping, stillValid(rects, order: k.order, links: k.links, root: root) {
+    d = k                                       // 沿用：parent／anchor 不因重疊長度變動而換
+  } else if let n = derive(rects, root: root) {
+    d = n
+  } else {
     throw Failure(msg: "螢幕排列不連通（需要邊相接），請先到系統設定修正")
   }
   var num = [root: 1]
@@ -346,9 +408,9 @@ var arranging = false              // 空白鍵切換：false = 校正模式、t
 var aSel: ID = 0, bSel: ID?, sideSel: Side?   // 排列：要搬的螢幕、貼靠的螢幕、貼在它的哪一側
 
 /// 排列預覽：A 貼到 B 的 side 側後的完整排列；還沒選齊或不可行回 nil
-func preview() -> [ID: R]? {
+func preview() -> Plan? {
   guard arranging, let b = bSel, let side = sideSel else { return nil }
-  return arranged(layout(M.order, M.links, M.rects, M.off), a: aSel, side: side, b: b, root: M.order[0])
+  return arranged(layout(M.order, M.links, M.rects, M.off), order: M.order, links: M.links, a: aSel, side: side, b: b)
 }
 
 func rebuildWindows() {
@@ -373,7 +435,7 @@ func redraw() {
       if id == aSel { return pv != nil ? .ghost : .mover }
       return id == bSel ? .target : .normal
     }
-    items = (pv ?? layout(M.order, M.links, M.rects, M.off)).map { id, r in
+    items = (pv?.rects ?? layout(M.order, M.links, M.rects, M.off)).map { id, r in
       MapItem(num: M.num[id]!, name: M.names[id]!, r: r, role: role(id))
     }
     let status: String
@@ -398,7 +460,7 @@ func redraw() {
   for (id, v) in views {
     v.marks = marks[id] ?? []; v.badge = "\(M.num[id]!)  \(M.names[id]!)"
     v.map = items; v.hints = hints
-    v.banner = arranging ? "【排列模式】空白鍵／Esc → 回校正模式　q 離開程式" : "【校正模式】空白鍵 → 排列模式　Enter 套用　p 永久"
+    v.banner = arranging ? "【排列模式】空白鍵／Esc → 回校正模式　q 離開程式" : "【校正模式】空白鍵 → 排列模式　Enter 套用　p 永久　f 換定位"
     v.bannerBG = arranging ? NSColor.systemBlue : NSColor.black.withAlphaComponent(0.7)
     v.needsDisplay = true
   }
@@ -434,7 +496,7 @@ func scheduleReload(_ delay: Double) {
 }
 
 func reload() {
-  do { M = try load() } catch let e as Failure { quit(e.msg) } catch { quit("\(error)") }
+  do { M = try load(keeping: (M.order, M.links)) } catch let e as Failure { quit(e.msg) } catch { quit("\(error)") }
   active = min(active, M.kids.count - 1)
   if arranging && (M.rects[aSel] == nil || bSel.map({ M.rects[$0] == nil }) == true) {
     arranging = false; bSel = nil; sideSel = nil      // 排列中拔掉螢幕：選取已失效，退回校正模式
@@ -492,6 +554,25 @@ func nudge(_ delta: Int) {
   say("\(M.names[id]!) \(cm(M.links[id]!.anchor - o[id]!, id))（Enter 套用）")
 }
 
+/// f：把目前這台的定位螢幕（parent）換成下一台與它邊相接的螢幕。位置不動，只改紅線相對誰。
+/// 一律用「含未套用調整」的位置 cur 算，這樣先調再換不會丟掉調整。
+func cycleParent() {
+  let x = M.kids[active], cur = layout(M.order, M.links, M.rects, M.off), nums = M.num.sorted { $0.value < $1.value }.map { $0.key }
+  let from = nums.firstIndex(of: M.links[x]!.parent)!
+  for k in 1..<nums.count {
+    let u = nums[(from + k) % nums.count]
+    guard u != x, let c = link(cur, parent: u, child: x) else { continue }
+    var l = M.links
+    l[x] = c.link
+    guard let o = topo(M.order[0], l) else { continue }      // 選到自己的子孫會成環，跳過
+    M.order = o; M.links = l; M.off = offsets(cur, l)
+    redraw()
+    say("\(M.names[x]!) 改對 \(M.names[u]!) 調整（\(c.link.side.horizontalLine ? "橫線，上下鍵" : "直線，左右鍵")）")
+    return
+  }
+  say("沒有其他可當定位的相接螢幕")
+}
+
 func setArranging(_ on: Bool) {
   arranging = on; bSel = nil; sideSel = nil
   if on { aSel = M.kids[active] }
@@ -516,8 +597,10 @@ func handleArrange(_ k: Key) {
     guard id != aSel else { say("不能貼到自己，請選另一台"); return }
     bSel = id
   case .enter:
-    guard let r = preview() else { say("先選貼靠的螢幕與方向，看到橘色虛線再按 Enter"); return }
-    setArranging(false); commit(r); return
+    guard let p = preview() else { say("先選貼靠的螢幕與方向，看到橘色虛線再按 Enter"); return }
+    setArranging(false)
+    M.order = p.order; M.links = p.links; M.off = offsets(p.rects, p.links)   // 新拓樸先記下，reload 才會沿用
+    commit(p.rects); return
   case .esc: setArranging(false); return
   case .quit: quit()
   default: break
@@ -543,6 +626,7 @@ func handle(_ k: Key) {
     switch c {
     case UInt8(ascii: ","): nudge(1)
     case UInt8(ascii: "."): nudge(-1)
+    case UInt8(ascii: "f"): cycleParent()
     case UInt8(ascii: "p"): commit(layout(M.order, M.links, M.rects, M.off), permanent: true)
     case UInt8(ascii: "r"):
       if Set(start.keys) == Set(M.rects.keys) { commit(start) } else { say("螢幕組合已改變，無法還原") }
@@ -554,7 +638,7 @@ func handle(_ k: Key) {
 rebuildWindows(); redraw()
 NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
                                        object: nil, queue: .main) { _ in scheduleReload(0.3) }
-print("【校正模式】Tab 換螢幕  上下／左右=移線(約 2mm)  , . 微調 1pt  Enter 套用(僅本次登入)  p 永久套用  r 還原  q 離開\r")
+print("【校正模式】Tab 換螢幕  f 換定位螢幕  上下／左右=移線(約 2mm)  , . 微調 1pt  Enter 套用(僅本次登入)  p 永久套用  r 還原  q 離開\r")
 print("【排列模式】空白鍵切換：Tab 選要搬的螢幕 → 編號選貼靠的螢幕 → 方向鍵選哪一側 → Enter（螢幕中央有示意圖）\r")
 print("注意：Enter 只在本次登入有效（登出後還原），要保留請按 p。游標只在參考線那一點完全不跳。\r")
 
