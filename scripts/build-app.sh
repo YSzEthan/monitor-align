@@ -5,8 +5,10 @@ set -eu
 cd "$(dirname "$0")/.."
 OUT=${OUT:-build}/MonitorAlign.app
 rm -rf "$OUT"
-mkdir -p "$OUT/Contents/MacOS"
+mkdir -p "$OUT/Contents/MacOS" "$OUT/Contents/Resources"
 swiftc -O monitor-align.swift -o "$OUT/Contents/MacOS/monitor-align"
+# app 內「重新簽章…」要用：Release 的使用者沒有這個 repo
+cp scripts/ensure-cert.sh "$OUT/Contents/Resources/"
 sed "s/__VERSION__/${VERSION:-dev}/g" Info.plist > "$OUT/Contents/Info.plist"
 codesign --force -s - --identifier dev.monitor-align "$OUT"
 echo "$OUT"

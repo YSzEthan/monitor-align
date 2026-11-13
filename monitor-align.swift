@@ -1,5 +1,6 @@
 import AppKit
 import CoreGraphics
+import CryptoKit
 import ServiceManagement
 
 // 多螢幕游標修正：常駐選單列，游標跨過相鄰螢幕的交界時，依實體公釐換算沿邊位置再放到對面螢幕。
@@ -168,6 +169,79 @@ func mergeCalib(_ old: [CalPair], _ new: [CalPair]) -> [CalPair] {
   old.filter { o in !new.contains { Set([$0.a, $0.b]) == Set([o.a, o.b]) } } + new
 }
 
+// MARK: - 版號與更新（純資料；不碰網路、檔案與 AppKit）
+
+let releaseRepo = "YSzEthan/monitor-align"
+
+/// 版號：X.Y.Z（stable）或 X.Y.Z-beta.N。其他 prerelease（-rc 等）一律拒絕
+struct Semver: Comparable {
+  let core: [Int]   // major、minor、patch
+  let beta: Int?    // nil = stable
+  var text: String { core.map(String.init).joined(separator: ".") + (beta.map { "-beta.\($0)" } ?? "") }
+  /// semver 優先序：先比 X.Y.Z；相同時 stable 大於 beta，beta 之間比 N（數字）
+  static func < (a: Semver, b: Semver) -> Bool {
+    if a.core != b.core { return a.core.lexicographicallyPrecedes(b.core) }
+    switch (a.beta, b.beta) {
+    case let (x?, y?): return x < y
+    case (_?, nil): return true
+    default: return false
+    }
+  }
+}
+
+private func digits(_ s: Substring) -> Int? { !s.isEmpty && s.allSatisfy { $0.isASCII && $0.isNumber } ? Int(s) : nil }
+
+/// `v` 前綴可有可無（CFBundleShortVersionString 不帶 v、tag 帶 v）
+func parseSemver(_ s: String) -> Semver? {
+  let t = s.hasPrefix("v") ? s.dropFirst() : Substring(s)
+  let halves = t.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
+  let nums = halves[0].split(separator: ".", omittingEmptySubsequences: false).map(digits)
+  guard nums.count == 3, !nums.contains(where: { $0 == nil }) else { return nil }
+  var beta: Int?
+  if halves.count == 2 {
+    let p = halves[1].split(separator: ".", omittingEmptySubsequences: false)
+    guard p.count == 2, p[0] == "beta", let n = digits(p[1]) else { return nil }
+    beta = n
+  }
+  return Semver(core: nums.compactMap { $0 }, beta: beta)
+}
+
+/// 只收標準寫法的 tag（`v` 開頭、沒有前導 0）：它會被拿去組下載網址，不能有任何額外字元
+func canonicalTag(_ tag: String) -> Semver? {
+  guard let v = parseSemver(tag), "v" + v.text == tag else { return nil }
+  return v
+}
+
+func isNewer(_ latest: String, than current: String) -> Bool {
+  guard let a = parseSemver(latest), let b = parseSemver(current) else { return false }
+  return a > b
+}
+
+func assetName(_ tag: String) -> String? { canonicalTag(tag).map { "MonitorAlign-v\($0.text)-arm64.zip" } }
+
+/// 下載網址由 app 自己用 tag 組，不採用 API 回傳的 browser_download_url
+func downloadURL(_ tag: String, sha: Bool = false) -> URL? {
+  guard let n = assetName(tag) else { return nil }
+  return URL(string: "https://github.com/\(releaseRepo)/releases/download/\(tag)/\(n)\(sha ? ".sha256" : "")")
+}
+
+/// `/releases` 的 JSON 陣列 → 最新的 tag。略過 draft；includeBeta 為 false 時略過 beta；tag 不合標準寫法的整筆略過
+func pickLatest(_ data: Data, includeBeta: Bool) -> String? {
+  struct Rel: Decodable { let tag_name: String; let draft: Bool; let prerelease: Bool }
+  guard let rels = try? JSONDecoder().decode([Rel].self, from: data) else { return nil }
+  return rels.compactMap { r -> Semver? in
+    guard !r.draft, let v = canonicalTag(r.tag_name), includeBeta || (!r.prerelease && v.beta == nil) else { return nil }
+    return v
+  }.max().map { "v" + $0.text }
+}
+
+/// `.sha256` 檔（`<64 位小寫十六進位>  <檔名>`）→ 雜湊；檔名不符或格式不對就是 nil
+func parseSha256(_ text: String, file: String) -> String? {
+  let f = text.split(whereSeparator: \.isWhitespace)
+  guard f.count == 2, f[1] == file, f[0].count == 64, f[0].allSatisfy({ $0.isASCII && ($0.isNumber || ("a"..."f").contains($0)) }) else { return nil }
+  return String(f[0])
+}
+
 func selftest() -> Never {
   var fails = 0
   func check(_ ok: Bool, _ what: String) { if !ok { fails += 1; print("FAIL: \(what)") } }
@@ -244,6 +318,38 @@ func selftest() -> Never {
   check(scale(1440, 2560, CGSize(width: 597, height: 336)) != nil, "scale 旋轉")
   check(scale(1920, 1080, .zero) == nil, "scale mm=0")
   check(scale(1920, 1080, CGSize(width: 300, height: 300)) == nil, "scale 比例不合")
+  // 版號與更新
+  check(parseSemver("v0.1.0-beta.2") == Semver(core: [0, 1, 0], beta: 2) && parseSemver("1.2.3") == Semver(core: [1, 2, 3], beta: nil), "parseSemver：v 前綴可有可無、beta")
+  for bad in ["dev", "", "v", "1.2", "1.2.3.4", "1.2.x", "v1.2.3-rc.1", "v1.2.3-beta", "v1.2.3-beta.", "v1.2.3-beta.x", "v1.2.3-", "v1.2.3-beta.1.2", "-1.2.3", "+1.2.3", "１.2.3", "1.2.3-Beta.1", "1..3"] {
+    check(parseSemver(bad) == nil, "parseSemver 拒絕：\(bad)")
+  }
+  check(isNewer("v0.1.1", than: "0.1.0") && !isNewer("v0.1.0", than: "0.1.0") && !isNewer("v0.1.0", than: "0.1.1"), "isNewer：patch")
+  check(isNewer("v0.10.0", than: "0.9.0") && isNewer("v1.0.0", than: "0.99.99"), "isNewer：數字比較，不是字串")
+  check(isNewer("v0.2.0", than: "0.2.0-beta.9") && !isNewer("v0.2.0-beta.9", than: "0.2.0"), "isNewer：stable 大於同版 beta")
+  check(isNewer("v0.2.0-beta.10", than: "0.2.0-beta.9") && !isNewer("v0.2.0-beta.2", than: "0.2.0-beta.10"), "isNewer：beta N 比數字")
+  check(isNewer("v0.2.0-beta.1", than: "0.1.9") && !isNewer("v0.1.9", than: "0.2.0-beta.1"), "isNewer：下一版的 beta 大於上一版 stable")
+  check(!isNewer("v9.9.9", than: "dev") && !isNewer("garbage", than: "0.1.0"), "isNewer：dev 版或壞版號不提示")
+  check(assetName("v0.1.0-beta.1") == "MonitorAlign-v0.1.0-beta.1-arm64.zip" && assetName("v0.1.0") == "MonitorAlign-v0.1.0-arm64.zip", "assetName")
+  for bad in ["0.1.0", "v01.2.3", "v0.1.0/../x", "v0.1.0?x=1", "v0.1.0 ", "v0.1.0-rc.1"] { check(assetName(bad) == nil && downloadURL(bad) == nil, "tag 不合標準寫法不組網址：\(bad)") }
+  check(downloadURL("v0.1.0-beta.1")?.absoluteString == "https://github.com/YSzEthan/monitor-align/releases/download/v0.1.0-beta.1/MonitorAlign-v0.1.0-beta.1-arm64.zip", "downloadURL")
+  check(downloadURL("v0.1.0", sha: true)?.absoluteString.hasSuffix("/v0.1.0/MonitorAlign-v0.1.0-arm64.zip.sha256") == true, "downloadURL .sha256")
+  let rels = Data(#"""
+    [{"tag_name":"v0.2.0-beta.3","draft":false,"prerelease":true},
+     {"tag_name":"v0.2.0-beta.4","draft":true,"prerelease":true},
+     {"tag_name":"v0.1.5","draft":false,"prerelease":false},
+     {"tag_name":"v0.1.10","draft":false,"prerelease":false},
+     {"tag_name":"v0.3.0-rc.1","draft":false,"prerelease":true},
+     {"tag_name":"nightly","draft":false,"prerelease":false},
+     {"tag_name":"v9.0.0","draft":false,"prerelease":true}]
+    """#.utf8)
+  check(pickLatest(rels, includeBeta: false) == "v0.1.10", "pickLatest：stable 通道略過 beta、draft、壞 tag；0.1.10 > 0.1.5")
+  check(pickLatest(rels, includeBeta: true) == "v9.0.0", "pickLatest：beta 通道取最大（含 prerelease 旗標的 stable 形式 tag）")
+  let rels2 = Data(#"[{"tag_name":"v0.2.0-beta.3","draft":false,"prerelease":true},{"tag_name":"v0.2.0","draft":false,"prerelease":false},{"tag_name":"v0.1.9","draft":false,"prerelease":false}]"#.utf8)
+  check(pickLatest(rels2, includeBeta: true) == "v0.2.0", "pickLatest：stable 發出後，beta 通道選到 stable")
+  check(pickLatest(Data("[]".utf8), includeBeta: true) == nil && pickLatest(Data("壞掉".utf8), includeBeta: false) == nil && pickLatest(Data(#"{"message":"rate limit"}"#.utf8), includeBeta: true) == nil, "pickLatest：空清單、壞 JSON、API 錯誤物件")
+  let h = String(repeating: "ab", count: 32)
+  check(parseSha256("\(h)  MonitorAlign-v0.1.0-arm64.zip\n", file: "MonitorAlign-v0.1.0-arm64.zip") == h, "parseSha256")
+  check(parseSha256("\(h)  other.zip", file: "MonitorAlign-v0.1.0-arm64.zip") == nil && parseSha256("zz  MonitorAlign-v0.1.0-arm64.zip", file: "MonitorAlign-v0.1.0-arm64.zip") == nil && parseSha256(h.uppercased() + "  f", file: "f") == nil && parseSha256("", file: "f") == nil, "parseSha256：檔名不符、格式不對、大寫、空")
   print(fails == 0 ? "selftest 通過" : "selftest 失敗 \(fails) 項")
   exit(fails == 0 ? 0 : 1)
 }
@@ -540,13 +646,143 @@ final class CalibSession {
   }
 }
 
+// MARK: - 簽章、安裝與更新（有副作用）
+
+let certName = "monitor-align-dev"            // 與 install.sh 同一張：從原始碼裝與從 Release 裝，授權互通
+let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
+let isDevBuild = parseSemver(appVersion) == nil  // 本機編譯的版號是 dev：不顯示更新相關選單
+let installedApp = NSString(string: "~/Applications/MonitorAlign.app").expandingTildeInPath
+let installDir = (installedApp as NSString).deletingLastPathComponent
+let stagedApp = installDir + "/.MonitorAlign.new.app", oldApp = installDir + "/.MonitorAlign.old.app"
+var signedLocally = false                      // 目前執行的 bundle 是否用本機憑證簽章（啟動時算一次）
+
+@discardableResult
+func run(_ exe: String, _ args: [String]) throws -> String {
+  let p = Process(); p.executableURL = URL(fileURLWithPath: exe); p.arguments = args
+  let pipe = Pipe(); p.standardOutput = pipe; p.standardError = pipe
+  try p.run()
+  let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+  p.waitUntilExit()
+  guard p.terminationStatus == 0 else { throw Failure(msg: "\((exe as NSString).lastPathComponent) 失敗：\(out)") }
+  return out
+}
+
+func hex(_ d: some Sequence<UInt8>) -> String { d.map { String(format: "%02x", $0) }.joined() }
+
+/// bundle 簽章憑證鏈第一張（leaf）的 SHA-1；ad-hoc 或沒簽章是 nil
+func leafHash(_ url: URL) -> String? {
+  var sc: SecStaticCode?
+  var info: CFDictionary?
+  guard SecStaticCodeCreateWithPath(url as CFURL, [], &sc) == errSecSuccess, let code = sc,
+        SecCodeCopySigningInformation(code, SecCSFlags(rawValue: kSecCSSigningInformation), &info) == errSecSuccess,
+        let leaf = ((info as? [String: Any])?[kSecCodeInfoCertificates as String] as? [SecCertificate])?.first else { return nil }
+  return hex(Insecure.SHA1.hash(data: SecCertificateCopyData(leaf) as Data))
+}
+
+/// 本機憑證的 SHA-1（小寫）。create 為 false 時沒有就丟錯（呼叫端用 try?）；為 true 時沒有就建立（可能跳鑰匙圈詢問）。找不到腳本回 nil
+func localCertHash(create: Bool) throws -> String? {
+  guard let script = Bundle.main.path(forResource: "ensure-cert", ofType: "sh") else { return nil }
+  let out = try run(script, (create ? [] : ["--no-create"]) + [certName])   // 最後一行是 hash；前面若有多餘的 stderr 不算
+  return out.split(separator: "\n").last.map { $0.lowercased() }
+}
+
+func refreshSignState() {
+  signedLocally = leafHash(Bundle.main.bundleURL).map { $0 == (try? localCertHash(create: false)) } ?? false
+}
+
+/// 新版啟動時清掉安裝殘留：`.old` 還在就代表上一次換版後新版沒活起來，交棒 shell 會負責換回，活著的這一版把它刪掉
+func cleanupInstallLeftovers() {
+  for p in [stagedApp, oldApp] { try? FileManager.default.removeItem(atPath: p) }
+}
+
+/// app 內唯一的安裝路徑（重新簽章與更新共用；install.sh 另走 rm＋ditto）：複製到同磁碟區暫存 → 去 quarantine → 簽章並驗證 → 原子交換 → 交棒重啟。
+/// 不能直接覆蓋執行中的 bundle（簽章頁對不上，系統會 SIGKILL）。任何一步失敗，舊版都不動
+func installBundle(_ src: URL, certHash: String) throws {
+  let fm = FileManager.default
+  try fm.createDirectory(atPath: installDir, withIntermediateDirectories: true)
+  cleanupInstallLeftovers()
+  do {
+    try run("/usr/bin/ditto", [src.path, stagedApp])
+    try run("/usr/bin/xattr", ["-cr", stagedApp])
+    // 第一次用鑰匙可能因鑰匙圈詢問回 errSecInternalComponent，重試一次
+    func sign() throws { try run("/usr/bin/codesign", ["--force", "-s", certHash, "--identifier", "dev.monitor-align", stagedApp]) }
+    do { try sign() } catch { try sign() }
+    try run("/usr/bin/codesign", ["--verify", "--strict", stagedApp])
+  } catch { try? fm.removeItem(atPath: stagedApp); throw error }
+
+  let oldHash = leafHash(URL(fileURLWithPath: installedApp))
+  if fm.fileExists(atPath: installedApp) {
+    guard renamex_np(stagedApp, installedApp, UInt32(RENAME_SWAP)) == 0 else { let e = errno; try? fm.removeItem(atPath: stagedApp); throw Failure(msg: "換版失敗（errno \(e)）") }
+    rename(stagedApp, oldApp)        // 交換後 staged 路徑上是舊版
+  } else {
+    guard rename(stagedApp, installedApp) == 0 else { let e = errno; try? fm.removeItem(atPath: stagedApp); throw Failure(msg: "安裝失敗（errno \(e)）") }
+  }
+  // 換版成功才清授權（rename 失敗時舊版與它的授權都不能動）；簽章身分沒變就保留
+  if oldHash != certHash { _ = try? run("/usr/bin/tccutil", ["reset", "Accessibility", "dev.monitor-align"]) }
+
+  // 交棒：等舊行程結束再開新版；10 秒後 `.old` 還在（新版沒活起來）就用舊版的執行檔換回。
+  // 換回前先 pkill 新版：它若活著但沒刪 `.old`，`open` 只會喚醒它而不會啟動換回來的舊版。
+  // 不用 pgrep 判斷存活（命令列含 app 路徑，會找到自己）、不用 open -n（會被單一實例檢查擋下）
+  let script = #"while kill -0 "$3" 2>/dev/null; do sleep 0.2; done; open "$1"; sleep 10; if [ -d "$2" ]; then pkill -f "$1/Contents/MacOS/monitor-align"; sleep 1; "$2/Contents/MacOS/monitor-align" --swap "$2" "$1"; open "$1"; fi"#
+  let p = Process(); p.executableURL = URL(fileURLWithPath: "/bin/sh")
+  p.arguments = ["-c", script, "sh", installedApp, oldApp, String(getpid())]
+  try p.run()
+}
+
+func confirm(_ msg: String, _ info: String, ok: String) -> Bool {
+  activateApp()
+  let a = NSAlert(); a.messageText = msg; a.informativeText = info
+  a.addButton(withTitle: ok); a.addButton(withTitle: "取消")
+  return a.runModal() == .alertFirstButtonReturn
+}
+
+func fetch(_ url: URL) async throws -> Data {
+  let (d, r) = try await URLSession.shared.data(from: url)
+  guard let code = (r as? HTTPURLResponse)?.statusCode else { throw Failure(msg: "沒有收到 HTTP 回應") }
+  guard code == 200 else { throw Failure(msg: "GitHub 回應 \(code)" + (code == 403 || code == 429 ? "（可能被限流，稍後再試）" : "")) }
+  guard d.count < 100_000_000 else { throw Failure(msg: "檔案異常地大") }
+  return d
+}
+
+/// 查最新版 → 使用者確認 → 下載、核對 SHA256、解壓、驗 bundle id 與版本 → installBundle。回傳 true 表示已交棒，呼叫端要結束
+func updateFlow(includeBeta: Bool, certHash: String) async throws -> Bool {
+  let list = try await fetch(URL(string: "https://api.github.com/repos/\(releaseRepo)/releases?per_page=100")!)
+  guard let tag = pickLatest(list, includeBeta: includeBeta) else { throw Failure(msg: "找不到可用的 Release") }
+  guard isNewer(tag, than: appVersion) else { await MainActor.run { alert("已是最新版", "目前 \(appVersion)；最新\(includeBeta ? "（含測試版）" : "")是 \(tag)。") }; return false }
+  let isBeta = canonicalTag(tag)?.beta != nil
+  guard await MainActor.run(body: { confirm("有新版 \(tag)\(isBeta ? "（測試版）" : "")", "目前 \(appVersion)。要下載並更新嗎？更新後會自動重啟，輔助使用授權保留。", ok: "下載並更新") }) else { return false }
+
+  guard let zipURL = downloadURL(tag), let shaURL = downloadURL(tag, sha: true), let name = assetName(tag) else { throw Failure(msg: "版號格式不符：\(tag)") }
+  let zip = try await fetch(zipURL)
+  guard let want = parseSha256(String(decoding: try await fetch(shaURL), as: UTF8.self), file: name) else { throw Failure(msg: "SHA256 檔格式不符") }
+  guard hex(SHA256.hash(data: zip)) == want else { throw Failure(msg: "SHA256 不符，已放棄更新") }
+
+  let tmp = NSTemporaryDirectory() + "monitor-align-" + UUID().uuidString
+  defer { try? FileManager.default.removeItem(atPath: tmp) }
+  try FileManager.default.createDirectory(atPath: tmp, withIntermediateDirectories: true)
+  try zip.write(to: URL(fileURLWithPath: tmp + "/a.zip"))
+  try run("/usr/bin/ditto", ["-x", "-k", tmp + "/a.zip", tmp + "/x"])
+  let new = URL(fileURLWithPath: tmp + "/x/MonitorAlign.app")
+  let info = Bundle(url: new)?.infoDictionary
+  guard info?["CFBundleIdentifier"] as? String == "dev.monitor-align",
+        let v = (info?["CFBundleShortVersionString"] as? String).flatMap(parseSemver), v == canonicalTag(tag) else { throw Failure(msg: "解壓出的 app 與 \(tag) 對不上，已放棄更新") }
+  try installBundle(new, certHash: certHash)
+  return true
+}
+
 // MARK: - 選單列
 
 final class AppCtl: NSObject {
   let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
   let statusI = NSMenuItem(), calI = NSMenuItem(), pauseI = NSMenuItem(), loginI = NSMenuItem()
+  let signI = NSMenuItem(), updateI = NSMenuItem(), betaI = NSMenuItem(), versionI = NSMenuItem()
   var session: CalibSession?
   var prompted = false
+  var updating = false
+  var betaUpdates: Bool {
+    get { UserDefaults.standard.bool(forKey: "betaUpdates") }
+    set { UserDefaults.standard.set(newValue, forKey: "betaUpdates") }
+  }
 
   func start() {
     if let img = NSImage(systemSymbolName: "display.2", accessibilityDescription: "monitor-align") {
@@ -554,12 +790,18 @@ final class AppCtl: NSObject {
     } else { item.button?.title = "MA" }
     let menu = NSMenu(); menu.autoenablesItems = false
     calI.title = "校正…"
-    for (i, sel) in [(statusI, #selector(openAX)), (calI, #selector(calibrate)), (pauseI, #selector(togglePause)),
-                     (loginI, #selector(toggleLogin))] { i.action = sel; i.target = self; menu.addItem(i) }
-    menu.insertItem(.separator(), at: 1)
-    menu.addItem(.separator())
-    let q = NSMenuItem(title: "結束", action: #selector(quit), keyEquivalent: "q"); q.target = self; menu.addItem(q)
+    signI.title = "重新簽章…"; betaI.title = "接收測試版（beta）"; versionI.title = "版本 \(appVersion)"; versionI.isEnabled = false
+    updateI.isHidden = isDevBuild; betaI.isHidden = isDevBuild   // 本機編譯（dev）不顯示更新相關選單
+    let q = NSMenuItem(title: "結束", action: #selector(quit), keyEquivalent: "q")
+    for (i, sel) in [(statusI, #selector(openAX)), (nil, nil), (calI, #selector(calibrate)), (pauseI, #selector(togglePause)),
+                     (loginI, #selector(toggleLogin)), (nil, nil), (signI, #selector(resign)), (updateI, #selector(checkUpdate)),
+                     (betaI, #selector(toggleBeta)), (versionI, nil), (nil, nil), (q, #selector(quit))] as [(NSMenuItem?, Selector?)] {
+      guard let i else { menu.addItem(.separator()); continue }
+      i.action = sel; i.target = self; menu.addItem(i)
+    }
     item.menu = menu
+    cleanupInstallLeftovers()    // 能跑到這裡，代表這一版活著
+    refreshSignState()
     reloadModel()
     NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { reloadModel(); self?.refresh() }
@@ -571,7 +813,7 @@ final class AppCtl: NSObject {
   /// 每 2 秒：授權後自動建 tap（不用重開）；授權被收回就收掉 tap
   func tick() {
     var trusted = AXIsProcessTrusted()
-    if !trusted && !prompted {
+    if !trusted && !prompted && signedLocally {   // 還沒用本機憑證簽章就授權，簽章後會失效、得再授權一次：先不問
       prompted = true
       trusted = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary)
     }
@@ -583,13 +825,16 @@ final class AppCtl: NSObject {
   func refresh() {
     let trusted = AXIsProcessTrusted()
     let s: String
-    if !trusted { s = "需要輔助使用權限（點此開啟設定）" }
+    if !trusted { s = signedLocally ? "需要輔助使用權限（點此開啟設定）" : "尚未用本機憑證簽章（請先按「重新簽章…」）" }
     else if let e = loadError { s = "不支援：\(e)" }
     else if glideTap == nil { s = "游標修正：無法啟動（請移除再重新授權）" }
     else if calibrating { s = "校正中（游標修正暫停）" }
     else if glidePaused { s = "游標修正：已暫停" }
     else { s = "游標修正：啟用" + (M.map { $0.uncal > 0 ? "（\($0.uncal) 組未校正）" : "" } ?? "") }
-    statusI.title = s; statusI.isEnabled = !trusted
+    statusI.title = s; statusI.isEnabled = !trusted && signedLocally
+    updateI.title = signedLocally ? "檢查更新…" : "檢查更新…（先重新簽章）"
+    updateI.isEnabled = signedLocally && !calibrating && !updating
+    betaI.state = betaUpdates ? .on : .off
     calI.isEnabled = M != nil && !calibrating
     pauseI.title = glidePaused ? "啟用游標修正" : "暫停游標修正"
     switch SMAppService.mainApp.status {
@@ -627,12 +872,37 @@ final class AppCtl: NSObject {
     refresh()
   }
 
+  /// 建立本機憑證（沒有的話）並用它重簽自己，裝到 ~/Applications 後重啟
+  @objc func resign() {
+    guard confirm("重新簽章", "會用你本機的憑證（沒有就建立，私鑰只在你的鑰匙圈）重簽 MonitorAlign、安裝到 ~/Applications 並重新啟動。簽章身分改變後，輔助使用要重新允許一次，之後更新就會保留。\n\nmacOS 可能跳出鑰匙圈存取詢問，請按「永遠允許」。", ok: "重新簽章") else { return }
+    do {
+      guard let h = try localCertHash(create: true) else { throw Failure(msg: "找不到憑證腳本（app 的 Resources 裡沒有 ensure-cert.sh）") }
+      try installBundle(Bundle.main.bundleURL, certHash: h)
+      NSApp.terminate(nil)
+    } catch { alert("重新簽章失敗", (error as? Failure)?.msg ?? error.localizedDescription) }
+  }
+
+  @objc func checkUpdate() {
+    guard signedLocally, !calibrating, !updating, let h = try? localCertHash(create: false) else { return }
+    updating = true; refresh()
+    let beta = betaUpdates
+    Task { @MainActor in
+      defer { updating = false; refresh() }
+      do { if try await updateFlow(includeBeta: beta, certHash: h) { NSApp.terminate(nil) } }
+      catch { alert("更新失敗", (error as? Failure)?.msg ?? error.localizedDescription) }
+    }
+  }
+
+  @objc func toggleBeta() { betaUpdates.toggle(); refresh() }
+
   @objc func quit() { NSApp.terminate(nil) }
 }
 
 // MARK: - 進入點
 
 let args = CommandLine.arguments
+// 交棒 shell 用：新版沒活起來時，用舊版的執行檔把兩個 bundle 原子換回（不能用 mv，中間會有 app 不存在的空窗）
+if args.count == 4, args[1] == "--swap" { exit(renamex_np(args[2], args[3], UInt32(RENAME_SWAP)) == 0 ? 0 : 1) }
 if args.contains("--selftest") { selftest() }
 if args.contains("--dump") { dump() }
 

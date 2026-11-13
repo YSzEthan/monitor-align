@@ -19,9 +19,13 @@ build/MonitorAlign.app/Contents/MacOS/monitor-align --dump       # 印螢幕、p
 
 ## 簽章與授權（改動時要記得）
 
-- 輔助使用授權綁簽章的 designated requirement。`install.sh` 用本機自簽憑證 `monitor-align-dev` 簽章，DR 不隨重新編譯改變，所以授權保留。
-- 自簽憑證**必須** `add-trusted-cert` 才能被 `codesign` 使用（首次安裝會要登入密碼）。憑證用 `/usr/bin/openssl`（LibreSSL）產生，openssl 3 的 PKCS#12 `security import` 讀不了。
-- 同名憑證可能有多張，`codesign -s` 一律傳 SHA-1 hash。
+- 輔助使用授權綁簽章的 designated requirement（`identifier + certificate leaf = H"<憑證 SHA-1>"`），與安裝路徑無關。`install.sh` 與 app 內「重新簽章…」都用本機自簽憑證 `monitor-align-dev`，DR 不隨重新編譯或更新改變，所以授權保留；ad-hoc 的 DR 是 cdhash，每次編譯都變。
+- 憑證由 `scripts/ensure-cert.sh` 建立與查詢（`install.sh` 與 app 共用，`build-app.sh` 會複製到 app 的 `Contents/Resources/`）。**不需要 `add-trusted-cert`**：自簽憑證沒被信任也能 `codesign`（實測），所以不會跳密碼視窗。也因此查憑證**不能加 `find-identity -v`**（`-v` 只列受信任的，會看不到它）。
+- 憑證用 `/usr/bin/openssl`（LibreSSL）產生，openssl 3 的 PKCS#12 `security import` 讀不了。同名憑證可能有多張，`codesign -s` 一律傳 SHA-1 hash。
+- 第一次用私鑰簽章可能因鑰匙圈詢問回 `errSecInternalComponent`，重試一次即可（`installBundle` 已處理）。
+- 簽章身分改變（ad-hoc → 本機憑證）時，舊的輔助使用那一列綁不上新簽章，要 `tccutil reset Accessibility dev.monitor-align` 再授權一次；`installBundle` 在換版成功後才清，且身分沒變就不清。
+- `installBundle`（重新簽章與檢查更新共用的唯一安裝路徑）：複製到 `~/Applications/.MonitorAlign.new.app` → `xattr -cr` → 簽章驗證 → `renamex_np(RENAME_SWAP)` 原子換版（舊版變 `.MonitorAlign.old.app`）→ 交棒 shell 等舊行程結束再 `open`。新版 `start()` 會刪 `.old`；10 秒後 `.old` 還在就代表新版沒活起來，shell 會 `pkill` 新版並用舊版的執行檔 `--swap` 換回。不能直接覆蓋執行中的 bundle（簽章頁對不上會被 SIGKILL），也不用 `open -n`（單一實例檢查會擋）、不用 `pgrep`（命令列含路徑會找到自己）。
+- 從瀏覽器下載的 app 會被 App Translocation 到隨機唯讀路徑執行，`Bundle.main.bundleURL` 仍可當 `ditto` 的來源，但會帶 `com.apple.quarantine`，所以一律 `xattr -cr`。
 - 不要用 event tap 抓鍵盤（會多一個 Input Monitoring 權限）；校正用 local `NSEvent` monitor 與 60Hz 輪詢游標位置。
 
 ## 分支與發版（專案例外）
