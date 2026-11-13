@@ -6,7 +6,7 @@ import ServiceManagement
 // 多螢幕游標修正：常駐選單列，游標跨過相鄰螢幕的交界時，依實體公釐換算沿邊位置再放到對面螢幕。
 // 每組相鄰螢幕各自校正一條參考線（滑鼠為主的引導式校正），不移動螢幕、沒有 parent。
 // 一律以 CGDirectDisplayID 為 key、CGDisplayBounds 座標（左上原點，整數 pt）。
-// 用法：app 模式不帶參數；CLI：--selftest、--dump。
+// 用法：app 模式不帶參數；CLI：--selftest、--dump、--make-icon <dir>（build 用）。
 
 typealias ID = CGDirectDisplayID
 
@@ -770,6 +770,86 @@ func updateFlow(includeBeta: Bool, certHash: String) async throws -> Bool {
   return true
 }
 
+// MARK: - icon（程式碼繪製，repo 不放二進位檔）
+
+// 兩個函式都只吃 CGContext（原點左下），顏色一律 sRGB 固定值：headless 與動態外觀下結果都一樣。
+private func srgb(_ r: CGFloat, _ g: CGFloat, _ b: CGFloat, _ a: CGFloat = 1) -> CGColor {
+  CGColor(srgbRed: r, green: g, blue: b, alpha: a)
+}
+private let iconRed = srgb(0.898, 0.196, 0.176)
+
+/// app icon：白底圓角方塊（照官方網格 824/1024、圓角 185）、黑線稿、紅線穿過大小兩台螢幕，游標壓在交界。
+/// 線寬以像素設下限，16／32px 才看得到線；那兩個尺寸沒有空間放游標，直接不畫。
+func drawAppIcon(_ ctx: CGContext, px: CGFloat) {
+  let s = px / 1024
+  ctx.saveGState(); defer { ctx.restoreGState() }
+  ctx.scaleBy(x: s, y: s)
+  let lw = max(30, 1.4 / s)
+  ctx.setLineJoin(.round); ctx.setLineCap(.round)
+  let tile = CGPath(roundedRect: CGRect(x: 100, y: 100, width: 824, height: 824), cornerWidth: 185, cornerHeight: 185, transform: nil)
+  ctx.addPath(tile); ctx.setFillColor(srgb(1, 1, 1)); ctx.fillPath()
+  ctx.addPath(tile); ctx.setStrokeColor(srgb(0.86, 0.86, 0.86)); ctx.setLineWidth(max(6, 1 / s)); ctx.strokePath()
+  // 螢幕：底部同在 y=330 的地平線上
+  ctx.setStrokeColor(srgb(0, 0, 0)); ctx.setLineWidth(lw)
+  for r in [CGRect(x: 200, y: 330, width: 370, height: 310), CGRect(x: 610, y: 330, width: 220, height: 200)] {
+    ctx.addPath(CGPath(roundedRect: r, cornerWidth: 28, cornerHeight: 28, transform: nil)); ctx.strokePath()
+  }
+  ctx.setStrokeColor(iconRed); ctx.setLineWidth(lw)
+  ctx.move(to: CGPoint(x: 165, y: 450)); ctx.addLine(to: CGPoint(x: 860, y: 450)); ctx.strokePath()
+  guard px > 32 else { return }
+  let arrow = CGMutablePath()
+  let o = CGPoint(x: 590, y: 450)      // 箭頭尖端
+  let pts: [(CGFloat, CGFloat)] = [(0, 0), (0, -150), (38, -116), (70, -176), (101, -160), (70, -101), (117, -96)]
+  arrow.move(to: o)
+  for (dx, dy) in pts.dropFirst() { arrow.addLine(to: CGPoint(x: o.x + dx, y: o.y + dy)) }
+  arrow.closeSubpath()
+  ctx.addPath(arrow); ctx.setStrokeColor(srgb(1, 1, 1)); ctx.setLineWidth(26); ctx.strokePath()
+  ctx.addPath(arrow); ctx.setFillColor(srgb(0, 0, 0)); ctx.fillPath()
+}
+
+/// 選單列樣板圖：18x18pt（1:1），只有 alpha 有意義（系統依深淺色反白）。橫線比兩台都長，
+/// 且先在螢幕邊框上挖出間隙，線才不會和邊框黏成一團。
+func drawTemplateIcon(_ ctx: CGContext) {
+  ctx.saveGState(); defer { ctx.restoreGState() }
+  ctx.setLineJoin(.round); ctx.setLineCap(.round)
+  ctx.setStrokeColor(srgb(0, 0, 0)); ctx.setLineWidth(1.2)
+  for r in [CGRect(x: 1.5, y: 4.75, width: 8, height: 8.5), CGRect(x: 11.5, y: 4.75, width: 5, height: 5.5)] {
+    ctx.addPath(CGPath(roundedRect: r, cornerWidth: 1.2, cornerHeight: 1.2, transform: nil)); ctx.strokePath()
+  }
+  ctx.setBlendMode(.clear); ctx.setLineCap(.butt); ctx.setLineWidth(2.8)
+  ctx.move(to: CGPoint(x: 0, y: 7.95)); ctx.addLine(to: CGPoint(x: 18, y: 7.95)); ctx.strokePath()
+  ctx.setBlendMode(.normal); ctx.setLineCap(.round); ctx.setLineWidth(1.2)
+  ctx.move(to: CGPoint(x: 0.6, y: 7.95)); ctx.addLine(to: CGPoint(x: 17.4, y: 7.95)); ctx.strokePath()
+}
+
+func templateIconImage() -> NSImage {
+  let img = NSImage(size: NSSize(width: 18, height: 18), flipped: false) { _ in
+    if let ctx = NSGraphicsContext.current?.cgContext { drawTemplateIcon(ctx) }
+    return true
+  }
+  img.isTemplate = true; img.accessibilityDescription = "monitor-align"
+  return img
+}
+
+/// --make-icon：寫出 <dir>/AppIcon.iconset，交給 iconutil。像素與座標 1:1（不走 lockFocus，它會跟著螢幕的 backing scale）。
+func makeIconset(into dir: String) -> Bool {
+  let set = dir + "/AppIcon.iconset"
+  do { try FileManager.default.createDirectory(atPath: set, withIntermediateDirectories: true) } catch { return false }
+  for base in [16, 32, 128, 256, 512] {
+    for scale in [1, 2] {
+      let px = base * scale
+      guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: px, pixelsHigh: px, bitsPerSample: 8, samplesPerPixel: 4,
+                                       hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0),
+            let gc = NSGraphicsContext(bitmapImageRep: rep) else { return false }
+      drawAppIcon(gc.cgContext, px: CGFloat(px))
+      guard let png = rep.representation(using: .png, properties: [:]) else { return false }
+      let name = "icon_\(base)x\(base)" + (scale == 2 ? "@2x" : "") + ".png"
+      guard (try? png.write(to: URL(fileURLWithPath: set + "/" + name))) != nil else { return false }
+    }
+  }
+  return true
+}
+
 // MARK: - 選單列
 
 final class AppCtl: NSObject {
@@ -785,9 +865,7 @@ final class AppCtl: NSObject {
   }
 
   func start() {
-    if let img = NSImage(systemSymbolName: "display.2", accessibilityDescription: "monitor-align") {
-      img.isTemplate = true; item.button?.image = img
-    } else { item.button?.title = "MA" }
+    item.button?.image = templateIconImage()
     let menu = NSMenu(); menu.autoenablesItems = false
     calI.title = "校正…"
     signI.title = "重新簽章…"; betaI.title = "接收測試版（beta）"; versionI.title = "版本 \(appVersion)"; versionI.isEnabled = false
@@ -903,6 +981,8 @@ final class AppCtl: NSObject {
 let args = CommandLine.arguments
 // 交棒 shell 用：新版沒活起來時，用舊版的執行檔把兩個 bundle 原子換回（不能用 mv，中間會有 app 不存在的空窗）
 if args.count == 4, args[1] == "--swap" { exit(renamex_np(args[2], args[3], UInt32(RENAME_SWAP)) == 0 ? 0 : 1) }
+// build-app.sh 在 codesign 之前呼叫：icns 要先進 Resources 才會被簽章封住。必須在單一實例檢查與 NSApplication 之前
+if args.count == 3, args[1] == "--make-icon" { exit(makeIconset(into: args[2]) ? 0 : 1) }
 if args.contains("--selftest") { selftest() }
 if args.contains("--dump") { dump() }
 

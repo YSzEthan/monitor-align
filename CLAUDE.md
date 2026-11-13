@@ -15,6 +15,7 @@ build/MonitorAlign.app/Contents/MacOS/monitor-align --dump       # 印螢幕、p
 
 - 純函式（`derivePairs`、`crossPoint`、校正檔 v2 的 `matchCalib`／`mergeCalib` 等）放最上面，`selftest()` 直接測；不要在這區碰 CG／AppKit。
 - event tap 的 callback 是 C function pointer，只能用全域變數（`M`、`glidePaused`、`calibrating`…）。
+- icon 由程式碼畫（`drawAppIcon`／`drawTemplateIcon`），不放二進位檔。`build-app.sh` 用剛編譯的 binary 跑 `--make-icon` → `iconutil` 產 `AppIcon.icns`，**必須在 `codesign` 之前**，否則簽章驗證不過。Finder 沒更新是 icon cache，不是 bug。
 - 校正檔 `~/.config/monitor-align/calib.json`（v2）：ref 是各螢幕的區域座標，key 為「廠牌-型號-序號/解析度」，與排列無關。舊格式一律忽略。
 
 ## 簽章與授權（改動時要記得）
