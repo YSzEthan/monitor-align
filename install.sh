@@ -5,36 +5,10 @@ set -eu
 cd "$(dirname "$0")"
 CERT=monitor-align-dev
 APP="$HOME/Applications/MonitorAlign.app"
-KC="$HOME/Library/Keychains/login.keychain-db"
 
-# 憑證的 SHA-1：同名可能有多張，一律用 hash 指定給 codesign
-identity() { security find-identity -p codesigning -v | awk -v n="\"$CERT\"" 'index($0, n) { print $2; exit }'; }
-
-make_cert() {
-  tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT   # 中途失敗也不留未加密私鑰
-  pw=$(/usr/bin/openssl rand -hex 12)
-  cat > "$tmp/c.cnf" <<CNF
-[req]
-distinguished_name=dn
-x509_extensions=ext
-prompt=no
-[dn]
-CN=$CERT
-[ext]
-basicConstraints=critical,CA:false
-keyUsage=critical,digitalSignature
-extendedKeyUsage=critical,codeSigning
-CNF
-  # 一定要用 /usr/bin/openssl（LibreSSL）：openssl 3 產的 PKCS#12，security import 讀不了
-  /usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -keyout "$tmp/k.pem" -out "$tmp/c.pem" -days 3650 -config "$tmp/c.cnf" 2>/dev/null
-  /usr/bin/openssl pkcs12 -export -inkey "$tmp/k.pem" -in "$tmp/c.pem" -out "$tmp/c.p12" -passout "pass:$pw"
-  security import "$tmp/c.p12" -k "$KC" -P "$pw" -x -T /usr/bin/codesign >/dev/null
-  echo "要信任這張本機憑證（只用於簽章）。請在跳出的視窗輸入登入密碼。"
-  security add-trusted-cert -p codeSign "$tmp/c.pem"
-}
-
-H=$(identity || true)
-if [ -z "$H" ]; then make_cert; H=$(identity || true); fi
+# 憑證的 SHA-1：沒有就建立（同名可能有多張，一律用 hash 指定給 codesign）。
+# 自簽憑證不需要 add-trusted-cert 也能簽章，所以不會跳密碼視窗
+H=$(scripts/ensure-cert.sh "$CERT") || H=
 
 scripts/build-app.sh >/dev/null
 NEW=build/MonitorAlign.app
