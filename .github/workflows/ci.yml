@@ -8,7 +8,18 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Version script test
+        run: scripts/test-next-version.sh
       - name: Build
         run: scripts/build-app.sh
       - name: Selftest
         run: build/MonitorAlign.app/Contents/MacOS/monitor-align --selftest
+  # 預設分支是 main：忘了 --base dev 的功能 PR 一合併就會直接發 stable、跳過 beta。
+  # 進 main 的 PR 只能來自 dev。設成 main 的必要檢查才擋得住。
+  base-guard:
+    if: github.base_ref == 'main' && github.head_ref != 'dev'
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "::error::進 main 的 PR 只能從 dev 來（stable 要先經過 beta）。請把 base 改成 dev。"
+          exit 1
