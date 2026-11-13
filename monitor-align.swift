@@ -783,19 +783,34 @@ private let iconRed = srgb(0.898, 0.196, 0.176)
 func drawAppIcon(_ ctx: CGContext, px: CGFloat) {
   let s = px / 1024
   ctx.saveGState(); defer { ctx.restoreGState() }
-  ctx.scaleBy(x: s, y: s)
-  let lw = max(30, 1.4 / s)
-  ctx.setLineJoin(.round); ctx.setLineCap(.round)
   let tile = CGPath(roundedRect: CGRect(x: 100, y: 100, width: 824, height: 824), cornerWidth: 185, cornerHeight: 185, transform: nil)
+  // 方塊：落下的柔和陰影（陰影參數不吃 CTM，要自己乘 s）＋ 白到極淡灰的垂直漸層
+  ctx.saveGState()
+  ctx.scaleBy(x: s, y: s)
+  ctx.setShadow(offset: CGSize(width: 0, height: -14 * s), blur: 28 * s, color: srgb(0, 0, 0, 0.28))
   ctx.addPath(tile); ctx.setFillColor(srgb(1, 1, 1)); ctx.fillPath()
-  ctx.addPath(tile); ctx.setStrokeColor(srgb(0.86, 0.86, 0.86)); ctx.setLineWidth(max(6, 1 / s)); ctx.strokePath()
-  // 螢幕：底部同在 y=330 的地平線上
-  ctx.setStrokeColor(srgb(0, 0, 0)); ctx.setLineWidth(lw)
-  for r in [CGRect(x: 200, y: 330, width: 370, height: 310), CGRect(x: 610, y: 330, width: 220, height: 200)] {
-    ctx.addPath(CGPath(roundedRect: r, cornerWidth: 28, cornerHeight: 28, transform: nil)); ctx.strokePath()
+  ctx.restoreGState()
+  ctx.scaleBy(x: s, y: s)
+  ctx.saveGState()
+  ctx.addPath(tile); ctx.clip()
+  if let g = CGGradient(colorsSpace: CGColorSpace(name: CGColorSpace.sRGB), colors: [srgb(1, 1, 1), srgb(0.945, 0.945, 0.95)] as CFArray, locations: [0, 1]) {
+    ctx.drawLinearGradient(g, start: CGPoint(x: 0, y: 924), end: CGPoint(x: 0, y: 100), options: [])
   }
-  ctx.setStrokeColor(iconRed); ctx.setLineWidth(lw)
-  ctx.move(to: CGPoint(x: 165, y: 450)); ctx.addLine(to: CGPoint(x: 860, y: 450)); ctx.strokePath()
+  ctx.restoreGState()
+  ctx.addPath(tile); ctx.setStrokeColor(srgb(0.86, 0.86, 0.86)); ctx.setLineWidth(max(5, 1 / s)); ctx.strokePath()
+  // 內容放大 12%，以內容中心對到方塊中心
+  ctx.translateBy(x: 512, y: 512); ctx.scaleBy(x: 1.12, y: 1.12); ctx.translateBy(x: -512, y: -485)
+  let lw = max(30, 1.4 / (s * 1.12))
+  ctx.setLineJoin(.round); ctx.setLineCap(.round)
+  // 螢幕：底部同在 y=330 的地平線上，內填淡灰
+  ctx.setLineWidth(lw)
+  for r in [CGRect(x: 200, y: 330, width: 370, height: 310), CGRect(x: 610, y: 330, width: 220, height: 200)] {
+    let path = CGPath(roundedRect: r, cornerWidth: 28, cornerHeight: 28, transform: nil)
+    ctx.addPath(path); ctx.setFillColor(srgb(0.94, 0.945, 0.95)); ctx.fillPath()
+    ctx.addPath(path); ctx.setStrokeColor(srgb(0, 0, 0)); ctx.strokePath()
+  }
+  ctx.setStrokeColor(iconRed)
+  ctx.move(to: CGPoint(x: 185, y: 450)); ctx.addLine(to: CGPoint(x: 840, y: 450)); ctx.strokePath()
   guard px > 32 else { return }
   let arrow = CGMutablePath()
   let o = CGPoint(x: 590, y: 450)      // 箭頭尖端
