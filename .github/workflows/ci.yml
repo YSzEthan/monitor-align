@@ -14,6 +14,14 @@ jobs:
         run: scripts/build-app.sh
       - name: Selftest
         run: build/MonitorAlign.app/Contents/MacOS/monitor-align --selftest
+      - name: DMG
+        run: |
+          scripts/make-dmg.sh build/MonitorAlign.app build/test.dmg
+          mnt=$(mktemp -d)
+          hdiutil attach build/test.dmg -mountpoint "$mnt" -nobrowse -readonly >/dev/null
+          trap 'hdiutil detach "$mnt" >/dev/null' EXIT
+          test -L "$mnt/Applications"
+          codesign --verify --strict "$mnt/MonitorAlign.app"
   # 預設分支是 main：忘了 --base dev 的功能 PR 一合併就會直接發 stable、跳過 beta。
   # 進 main 的 PR 只能來自 dev。設成 main 的必要檢查才擋得住。
   base-guard:
