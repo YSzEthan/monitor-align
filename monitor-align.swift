@@ -967,10 +967,13 @@ final class AppCtl: NSObject {
 
   /// 建立本機憑證（沒有的話）並用它重簽自己，裝到 ~/Applications 後重啟
   @objc func resign() {
-    guard confirm("重新簽章", "會用你本機的憑證（沒有就建立，私鑰只在你的鑰匙圈）重簽 MonitorAlign、安裝到 ~/Applications 並重新啟動。簽章身分改變後，輔助使用要重新允許一次，之後更新就會保留。\n\nmacOS 可能跳出鑰匙圈存取詢問，請按「永遠允許」。", ok: "重新簽章") else { return }
+    guard confirm("重新簽章", "會用你本機的憑證（沒有就建立，私鑰只在你的鑰匙圈）重簽 MonitorAlign、安裝到 ~/Applications 並重新啟動（若目前這份在 /Applications，會移到垃圾桶）。簽章身分改變後，輔助使用要重新允許一次，之後更新就會保留。\n\nmacOS 可能跳出鑰匙圈存取詢問，請按「永遠允許」。", ok: "重新簽章") else { return }
     do {
       guard let h = try localCertHash(create: true) else { throw Failure(msg: "找不到憑證腳本（app 的 Resources 裡沒有 ensure-cert.sh）") }
-      try installBundle(Bundle.main.bundleURL, certHash: h)
+      let src = Bundle.main.bundleURL
+      try installBundle(src, certHash: h)
+      // 從 DMG 拖進 /Applications 的那份是 ad-hoc 簽章，留著會和 ~/Applications 的同 bundle id 打架；唯讀來源會失敗，忽略
+      if src.path.hasPrefix("/Applications/") { try? FileManager.default.trashItem(at: src, resultingItemURL: nil) }
       NSApp.terminate(nil)
     } catch { alert("重新簽章失敗", (error as? Failure)?.msg ?? error.localizedDescription) }
   }

@@ -16,12 +16,12 @@ macOS 多螢幕游標修正。各螢幕每公釐的 point 數不同（解析度�
 
 ### 發版與下載
 
-合進 `dev` 自動發 **beta**（`vX.Y.Z-beta.N`，標為 prerelease）；`dev` 合進 `main` 自動發 **stable**（`vX.Y.Z`）。Release 附 `MonitorAlign-vX.Y.Z[-beta.N]-arm64.zip` 與 `.sha256`，只支援 Apple Silicon。PR 標籤 `minor`／`major` 升對應位數，`no-release` 不發版。
+合進 `dev` 自動發 **beta**（`vX.Y.Z-beta.N`，標為 prerelease）；`dev` 合進 `main` 自動發 **stable**（`vX.Y.Z`）。Release 附 `MonitorAlign-vX.Y.Z[-beta.N]-arm64.dmg`、`.zip` 與各自的 `.sha256`（zip 給 app 內更新用，`.sha256` 供人工核對），只支援 Apple Silicon。PR 標籤 `minor`／`major` 升對應位數，`no-release` 不發版。
 
 **從 Release 下載使用**
 
-1. 解壓後把 `MonitorAlign.app` 放到任何地方並開啟。第一次開啟可能被 Gatekeeper 擋（沒有公證），到「系統設定 → 隱私權與安全性」按「仍要打開」。
-2. 選單列圖示 → **重新簽章…**。它會在你的鑰匙圈建立本機憑證（沒有的話）、用它重簽自己、裝到 `~/Applications/MonitorAlign.app` 並重啟（macOS 可能跳鑰匙圈詢問，按「永遠允許」）。
+1. 開啟 `.dmg`，把 `MonitorAlign.app` 拖進「Applications」捷徑後開啟（也可解壓 zip 放任何地方）。第一次開啟可能被 Gatekeeper 擋（沒有公證），到「系統設定 → 隱私權與安全性」按「仍要打開」。
+2. 選單列圖示 → **重新簽章…**。它會在你的鑰匙圈建立本機憑證（沒有的話）、用它重簽自己、裝到 `~/Applications/MonitorAlign.app` 並重啟；若原本那份在 `/Applications`，會被移到垃圾桶（每個帳號各自重新簽章；macOS 可能跳鑰匙圈詢問，按「永遠允許」）。
 3. 重啟後到「輔助使用」允許 MonitorAlign 一次。之後更新都用這張憑證重簽，授權保留。
 
 沒做重新簽章前，app 不會跳輔助使用授權（簽章後授權會失效，先問也是白問）。
