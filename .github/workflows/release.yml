@@ -91,7 +91,9 @@ jobs:
           zip="MonitorAlign-v$VERSION-arm64.zip"
           mkdir dist
           ditto -c -k --keepParent build/MonitorAlign.app "dist/$zip"
-          (cd dist && shasum -a 256 "$zip" > "$zip.sha256")
+          dmg="MonitorAlign-v$VERSION-arm64.dmg"
+          scripts/make-dmg.sh build/MonitorAlign.app "dist/$dmg"
+          (cd dist && for f in "$zip" "$dmg"; do shasum -a 256 "$f" > "$f.sha256"; done)
           if [ "$CHANNEL" = main ]; then
             # stable 的 notes 從上一個 stable 算起，不然只會從最近一個 beta 開始
             flags=(--latest)
@@ -102,4 +104,4 @@ jobs:
           # tag 最後才建：上面任何一步失敗都不會留下沒有 release 的孤兒 tag。
           # 用 GITHUB_TOKEN 建的 tag 不會再觸發 workflow，所以不會迴圈。
           gh release create "v$VERSION" --target "$GITHUB_SHA" --title "v$VERSION" --generate-notes \
-            "${flags[@]}" "dist/$zip" "dist/$zip.sha256"
+            "${flags[@]}" "dist/$zip" "dist/$zip.sha256" "dist/$dmg" "dist/$dmg.sha256"
