@@ -10,6 +10,8 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Version script test
         run: scripts/test-next-version.sh
+      - name: Install script syntax
+        run: sh -n scripts/install-release.sh
       - name: Build
         run: scripts/build-app.sh
       - name: Selftest
